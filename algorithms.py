@@ -2582,7 +2582,7 @@ class UltimateIRM(ERM):
         mask[torch.arange(logits.size(0), device=logits.device), pseudo_labels] = False
         residual_probs = probs[mask].view(logits.size(0), self.num_classes - 1)
 
-        residual_variance = torch.var(residual_probs, dim=1)
+        residual_variance = torch.var(residual_probs, dim=1, unbiased=False)
 
         penalty = torch.exp(-5.0 * F.relu(residual_variance - self.dispersion_thresh))
         c_i = max_probs * penalty
@@ -2644,8 +2644,13 @@ class UltimateIRM(ERM):
             if self.update_count % self.stage2_interval == 0 or not self.cluster_initialized:
                 feat_np = feat_b_clean.cpu().numpy()
                 kmeans = KMeans(n_clusters=self.num_clusters, n_init=10).fit(feat_np)
-                self.cluster_centers = torch.tensor(kmeans.cluster_centers_).to(device)
-                self.cluster_initialized = True
+                new_centers = torch.tensor(kmeans.cluster_centers_).to(device)
+                if not self.cluster_initialized:
+                    self.cluster_centers = new_centers
+                    self.cluster_initialized = True
+                else:
+                    momentum = 0.9
+                    self.cluster_centers = momentum * self.cluster_centers + (1 - momentum) * new_centers
 
             distances = torch.cdist(feat_b_clean, self.cluster_centers)
             env_assignments = torch.argmin(distances, dim=1)
@@ -2665,7 +2670,7 @@ class UltimateIRM(ERM):
 
             for k in range(self.num_clusters):
                 mask_k = (env_assignments == k)
-                if mask_k.sum() < 2:
+                if mask_k.sum() < 4:
                     continue
 
                 logits_bk = logits_b_pert[mask_k]
