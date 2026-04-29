@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
+from sklearn.cluster import KMeans
+import torchvision.transforms as T
 
 import copy
 import numpy as np
@@ -57,6 +59,7 @@ ALGORITHMS = [
     'RDM',
     'ADRMX',
     'URM',
+    'UltimateIRM',
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -2548,5 +2551,146 @@ class ADRMX(Algorithm):
                 'loss_remixed': classifier_remixed_loss.item(),
                 }
     
+    def predict(self, x):
+        return self.network(x)
+
+
+class UltimateIRM(ERM):
+    """
+    终极架构：Confidence-Aware IRM + Residual Dispersion + TMP + Dynamic Clustering
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(UltimateIRM, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.register_buffer('update_count', torch.tensor([0]))
+        self.num_classes = num_classes
+
+        self.warmup_iters = 500
+        self.stage2_interval = 100
+        self.num_clusters = 3
+        self.dispersion_thresh = 0.05
+
+        self.tmp_masker = T.RandomErasing(p=1.0, scale=(0.1, 0.3), ratio=(0.5, 2.0), value='random')
+
+        self.register_buffer('cluster_centers', torch.zeros(self.num_clusters, self.featurizer.n_outputs))
+        self.cluster_initialized = False
+
+    def compute_confidence_and_dispersion(self, logits):
+        probs = F.softmax(logits, dim=1)
+        max_probs, pseudo_labels = torch.max(probs, dim=1)
+
+        mask = torch.ones_like(probs, dtype=torch.bool)
+        mask[torch.arange(logits.size(0), device=logits.device), pseudo_labels] = False
+        residual_probs = probs[mask].view(logits.size(0), self.num_classes - 1)
+
+        residual_variance = torch.var(residual_probs, dim=1, unbiased=False)
+
+        penalty = torch.exp(-5.0 * F.relu(residual_variance - self.dispersion_thresh))
+        c_i = max_probs * penalty
+
+        return pseudo_labels, c_i
+
+    def _soft_irm_penalty(self, logits, y, c_i):
+        device = logits.device
+        scale = torch.tensor(1.).to(device).requires_grad_()
+
+        loss_1 = F.cross_entropy(logits[::2] * scale, y[::2], reduction='none')
+        loss_2 = F.cross_entropy(logits[1::2] * scale, y[1::2], reduction='none')
+
+        loss_1 = torch.sum(loss_1 * c_i[::2]) / (torch.sum(c_i[::2]) + 1e-5)
+        loss_2 = torch.sum(loss_2 * c_i[1::2]) / (torch.sum(c_i[1::2]) + 1e-5)
+
+        grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
+        grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
+
+        return torch.sum(grad_1 * grad_2)
+
+    def update(self, minibatches, unlabeled=None):
+        device = 'cuda' if minibatches[0][0].is_cuda else 'cpu'
+        self.update_count += 1
+
+        all_x_a = torch.cat([x for x, y in minibatches])
+        all_y_a = torch.cat([y for x, y in minibatches])
+
+        feat_a = self.featurizer(all_x_a)
+        logits_a = self.classifier(feat_a)
+        loss_a_erm = F.cross_entropy(logits_a, all_y_a)
+
+        c_a = torch.ones_like(all_y_a, dtype=torch.float32)
+        irm_penalty_a = self._soft_irm_penalty(logits_a, all_y_a, c_a)
+
+        if unlabeled is None or len(unlabeled) == 0:
+            loss = loss_a_erm + self.hparams.get('irm_lambda', 1.0) * irm_penalty_a
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            return {'loss': loss.item()}
+
+        all_x_b = torch.cat([x for x in unlabeled])
+
+        with torch.no_grad():
+            feat_b_clean = self.featurizer(all_x_b)
+            logits_b_clean = self.classifier(feat_b_clean)
+            pseudo_labels_b, c_b = self.compute_confidence_and_dispersion(logits_b_clean)
+
+        total_loss = loss_a_erm
+        irm_penalty_b_total = 0.0
+
+        if self.update_count < self.warmup_iters:
+            mask_b = (c_b > 0.8).float()
+            logits_b = self.network(all_x_b)
+            loss_b_erm = torch.mean(F.cross_entropy(logits_b, pseudo_labels_b, reduction='none') * mask_b)
+            total_loss += loss_b_erm
+        else:
+            if self.update_count % self.stage2_interval == 0 or not self.cluster_initialized:
+                feat_np = feat_b_clean.cpu().numpy()
+                kmeans = KMeans(n_clusters=self.num_clusters, n_init=10).fit(feat_np)
+                new_centers = torch.tensor(kmeans.cluster_centers_).to(device)
+                if not self.cluster_initialized:
+                    self.cluster_centers = new_centers
+                    self.cluster_initialized = True
+                else:
+                    momentum = 0.9
+                    self.cluster_centers = momentum * self.cluster_centers + (1 - momentum) * new_centers
+
+            distances = torch.cdist(feat_b_clean, self.cluster_centers)
+            env_assignments = torch.argmin(distances, dim=1)
+
+            x_b_perturbed = all_x_b.clone()
+            for i in range(len(x_b_perturbed)):
+                if c_b[i] > 0.95:
+                    x_b_perturbed[i] = self.tmp_masker(x_b_perturbed[i])
+
+            feat_b_pert = self.featurizer(x_b_perturbed)
+            logits_b_pert = self.classifier(feat_b_pert)
+
+            loss_b_erm = torch.mean(F.cross_entropy(logits_b_pert, pseudo_labels_b, reduction='none') * c_b)
+            total_loss += loss_b_erm
+
+            irm_lambda = self.hparams.get('irm_lambda', 1.0)
+
+            for k in range(self.num_clusters):
+                mask_k = (env_assignments == k)
+                if mask_k.sum() < 4:
+                    continue
+
+                logits_bk = logits_b_pert[mask_k]
+                y_bk = pseudo_labels_b[mask_k]
+                c_bk = c_b[mask_k]
+
+                irm_penalty_bk = self._soft_irm_penalty(logits_bk, y_bk, c_bk)
+                irm_penalty_b_total += irm_penalty_bk
+
+            total_loss += irm_lambda * (irm_penalty_a + irm_penalty_b_total)
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return {
+            'loss': total_loss.item(),
+            'penalty_a': irm_penalty_a.item() if isinstance(irm_penalty_a, torch.Tensor) else 0.0,
+            'penalty_b': irm_penalty_b_total.item() if isinstance(irm_penalty_b_total, torch.Tensor) else 0.0
+        }
+
     def predict(self, x):
         return self.network(x)
