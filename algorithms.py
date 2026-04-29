@@ -2565,7 +2565,6 @@ class UltimateIRM(ERM):
         self.num_classes = num_classes
 
         self.warmup_iters = 500
-        self.stage2_interval = 100
         self.num_clusters = 3
         self.dispersion_thresh = 0.05
 
@@ -2645,20 +2644,21 @@ class UltimateIRM(ERM):
                 feat_np = feat_b_clean.cpu().numpy()
                 kmeans = KMeans(n_clusters=self.num_clusters, n_init=10).fit(feat_np)
                 with torch.no_grad():
-                    self.cluster_centers.copy_(torch.tensor(kmeans.cluster_centers_, device=device))
+                    self.cluster_centers.copy_(
+                        torch.tensor(kmeans.cluster_centers_, dtype=torch.float32, device=device)
+                    )
                 self.cluster_initialized = True
 
             distances = torch.cdist(feat_b_clean, self.cluster_centers)
             env_assignments = torch.argmin(distances, dim=1)
 
-            if self.update_count % self.stage2_interval == 0:
-                momentum = 0.99
-                with torch.no_grad():
-                    for k in range(self.num_clusters):
-                        mask_k = (env_assignments == k)
-                        if mask_k.sum() > 0:
-                            batch_center_k = feat_b_clean[mask_k].mean(dim=0)
-                            self.cluster_centers[k].lerp_(batch_center_k, weight=1.0 - momentum)
+            momentum = 0.99
+            with torch.no_grad():
+                for k in range(self.num_clusters):
+                    mask_k = (env_assignments == k)
+                    if mask_k.sum() > 0:
+                        batch_center_k = feat_b_clean[mask_k].mean(dim=0)
+                        self.cluster_centers[k].lerp_(batch_center_k, weight=1.0 - momentum)
 
             x_b_perturbed = all_x_b.clone()
             for i in range(len(x_b_perturbed)):
