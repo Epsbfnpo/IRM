@@ -2641,19 +2641,24 @@ class UltimateIRM(ERM):
             loss_b_erm = torch.mean(F.cross_entropy(logits_b, pseudo_labels_b, reduction='none') * mask_b)
             total_loss += loss_b_erm
         else:
-            if self.update_count % self.stage2_interval == 0 or not self.cluster_initialized:
+            if not self.cluster_initialized:
                 feat_np = feat_b_clean.cpu().numpy()
                 kmeans = KMeans(n_clusters=self.num_clusters, n_init=10).fit(feat_np)
-                new_centers = torch.tensor(kmeans.cluster_centers_).to(device)
-                if not self.cluster_initialized:
-                    self.cluster_centers = new_centers
-                    self.cluster_initialized = True
-                else:
-                    momentum = 0.9
-                    self.cluster_centers = momentum * self.cluster_centers + (1 - momentum) * new_centers
+                with torch.no_grad():
+                    self.cluster_centers.copy_(torch.tensor(kmeans.cluster_centers_, device=device))
+                self.cluster_initialized = True
 
             distances = torch.cdist(feat_b_clean, self.cluster_centers)
             env_assignments = torch.argmin(distances, dim=1)
+
+            if self.update_count % self.stage2_interval == 0:
+                momentum = 0.99
+                with torch.no_grad():
+                    for k in range(self.num_clusters):
+                        mask_k = (env_assignments == k)
+                        if mask_k.sum() > 0:
+                            batch_center_k = feat_b_clean[mask_k].mean(dim=0)
+                            self.cluster_centers[k].lerp_(batch_center_k, weight=1.0 - momentum)
 
             x_b_perturbed = all_x_b.clone()
             for i in range(len(x_b_perturbed)):
