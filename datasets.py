@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 from PIL import Image, ImageFile
 from torchvision import transforms
@@ -11,7 +12,7 @@ from wilds.datasets.fmow_dataset import FMoWDataset
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-DATASETS = ["Debug28", "Debug224", "ColoredMNIST", "RotatedMNIST", "VLCS", "PACS", "OfficeHome", "TerraIncognita", "DomainNet", "SVIRO", "WILDSCamelyon", "WILDSFMoW", "SpawriousO2O_easy", "SpawriousO2O_medium", "SpawriousO2O_hard", "SpawriousM2M_easy", "SpawriousM2M_medium", "SpawriousM2M_hard",]
+DATASETS = ["Debug28", "Debug224", "ColoredMNIST", "RotatedMNIST", "VLCS", "PACS", "OfficeHome", "TerraIncognita", "DomainNet", "SVIRO", "WILDSCamelyon", "WILDSFMoW", "SpawriousO2O_easy", "SpawriousO2O_medium", "SpawriousO2O_hard", "SpawriousM2M_easy", "SpawriousM2M_medium", "SpawriousM2M_hard", "OpenSetDomainNetObjects",]
 
 def get_dataset_class(dataset_name):
     if dataset_name not in globals():
@@ -235,6 +236,45 @@ class WILDSFMoW(WILDSDataset):
         dataset = FMoWDataset(root_dir=root)
         super().__init__(dataset, "region", test_envs, hparams['data_augmentation'], hparams)
 
+
+
+class SimpleImageListDataset(Dataset):
+    def __init__(self, samples, transform=None):
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, label = self.samples[index]
+        image = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, torch.tensor(label, dtype=torch.long)
+
+
+def collect_imagefolder_samples(root, keep_classes=None, label_map=None):
+    dataset = ImageFolder(root=root)
+    samples = []
+    for path, old_y in dataset.samples:
+        class_name = dataset.classes[old_y]
+        if keep_classes is not None and class_name not in keep_classes:
+            continue
+        if label_map is None:
+            new_y = old_y
+        else:
+            new_y = label_map[class_name]
+        samples.append((path, new_y))
+    return samples
+
+
+def sample_n(samples, n, seed=0):
+    rng = random.Random(seed)
+    samples = list(samples)
+    rng.shuffle(samples)
+    return samples[:n]
+
 class CustomImageFolder(Dataset):
     def __init__(self, folder_path, class_index, limit=None, transform=None):
         self.folder_path = folder_path
@@ -366,3 +406,64 @@ class SpawriousM2M_hard(SpawriousBenchmark):
         test = ["snow","beach","dirt","jungle"]
         combinations = self.build_type2_combination(group,test)
         super().__init__(combinations['train_combinations'], combinations['test_combinations'], root_dir, hparams['data_augmentation'])
+
+
+class OpenSetDomainNetObjects(MultipleDomainDataset):
+    CHECKPOINT_FREQ = 1000
+    ENVIRONMENTS = ["A_real", "A_paint", "B_mix", "T_clip"]
+    UNLABELED_ENVS = [2]
+    INPUT_SHAPE = (3, 224, 224)
+
+    def __init__(self, root, test_envs, hparams):
+        super().__init__()
+        self.id_classes = ["book", "clock", "keyboard", "lamp", "mug", "scissors"]
+        self.num_classes = len(self.id_classes)
+        label_map = {name: idx for idx, name in enumerate(self.id_classes)}
+
+        transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        augment_transform = transforms.Compose([transforms.RandomResizedCrop(224, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+
+        a_real_samples = collect_imagefolder_samples(os.path.join(root, "domain_net", "real"), keep_classes=self.id_classes, label_map=label_map)
+        a_paint_samples = collect_imagefolder_samples(os.path.join(root, "domain_net", "paint"), keep_classes=self.id_classes, label_map=label_map)
+        b_id_samples = collect_imagefolder_samples(os.path.join(root, "domain_net", "sketch"), keep_classes=self.id_classes, label_map=label_map)
+        t_samples = collect_imagefolder_samples(os.path.join(root, "domain_net", "clip"), keep_classes=self.id_classes, label_map=label_map)
+
+        terra_samples = [(path, -1) for path, _ in collect_imagefolder_samples(os.path.join(root, "terra_incognita", "L100"))]
+        sviro_samples = [(path, -1) for path, _ in collect_imagefolder_samples(os.path.join(root, "sviro", "aclass"))]
+
+        spaw_root = os.path.join(root, "spawrious224")
+        spaw_samples = []
+        if os.path.isdir(spaw_root):
+            for split in sorted(os.listdir(spaw_root)):
+                split_root = os.path.join(spaw_root, split)
+                if not os.path.isdir(split_root):
+                    continue
+                for location in sorted(os.listdir(split_root)):
+                    location_root = os.path.join(split_root, location)
+                    if not os.path.isdir(location_root):
+                        continue
+                    spaw_samples.extend([(path, -1) for path, _ in collect_imagefolder_samples(location_root)])
+
+        ood_all = terra_samples + sviro_samples + spaw_samples
+        rho = hparams.get("open_set_ood_ratio", 0.5)
+        max_ood_per_source = hparams.get("open_set_max_ood_per_source", 5000)
+        if max_ood_per_source is not None:
+            terra_samples = sample_n(terra_samples, min(max_ood_per_source, len(terra_samples)), seed=1)
+            sviro_samples = sample_n(sviro_samples, min(max_ood_per_source, len(sviro_samples)), seed=2)
+            spaw_samples = sample_n(spaw_samples, min(max_ood_per_source, len(spaw_samples)), seed=3)
+            ood_all = terra_samples + sviro_samples + spaw_samples
+
+        num_id = len(b_id_samples)
+        num_ood = int(num_id * rho / max(1e-8, (1 - rho)))
+        ood_samples = sample_n(ood_all, min(num_ood, len(ood_all)), seed=0)
+
+        b_mix_samples = b_id_samples + ood_samples
+        random.Random(0).shuffle(b_mix_samples)
+
+        self.datasets = [
+            SimpleImageListDataset(a_real_samples, transform=augment_transform),
+            SimpleImageListDataset(a_paint_samples, transform=augment_transform),
+            SimpleImageListDataset(b_mix_samples, transform=transform),
+            SimpleImageListDataset(t_samples, transform=transform),
+        ]
+        self.input_shape = self.INPUT_SHAPE
