@@ -74,50 +74,61 @@ if __name__ == "__main__":
         dataset = vars(datasets)[args.dataset](args.data_dir, args.test_envs, hparams)
     else:
         raise NotImplementedError
-    in_splits = []
-    out_splits = []
+    unlabeled_envs = set(getattr(dataset, "UNLABELED_ENVS", []))
+    test_envs = set(args.test_envs)
+    train_splits = []
+    eval_splits = []
     uda_splits = []
     for env_i, env in enumerate(dataset):
-        uda = []
+        if env_i in unlabeled_envs:
+            uda_weights = misc.make_weights_for_balanced_classes(env) if hparams['class_balanced'] else None
+            uda_splits.append((env, uda_weights))
+            eval_splits.append((f'env{env_i}_uda', env, uda_weights))
+            continue
         out, in_ = misc.split_dataset(env, int(len(env)*args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
-        if env_i in args.test_envs:
-            uda, in_ = misc.split_dataset(in_, int(len(in_)*args.uda_holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
         if hparams['class_balanced']:
             in_weights = misc.make_weights_for_balanced_classes(in_)
             out_weights = misc.make_weights_for_balanced_classes(out)
-            if uda is not None:
-                uda_weights = misc.make_weights_for_balanced_classes(uda)
         else:
-            in_weights, out_weights, uda_weights = None, None, None
-        in_splits.append((in_, in_weights))
-        out_splits.append((out, out_weights))
-        if len(uda):
-            uda_splits.append((uda, uda_weights))
+            in_weights, out_weights = None, None
+
+        if env_i in test_envs:
+            if args.task == "domain_adaptation" and args.uda_holdout_fraction > 0:
+                uda_subset, in_ = misc.split_dataset(in_, int(len(in_)*args.uda_holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
+                uda_subset_weights = misc.make_weights_for_balanced_classes(uda_subset) if hparams['class_balanced'] else None
+                if len(uda_subset):
+                    uda_splits.append((uda_subset, uda_subset_weights))
+                    eval_splits.append((f'env{env_i}_uda', uda_subset, uda_subset_weights))
+                    in_weights = misc.make_weights_for_balanced_classes(in_) if hparams['class_balanced'] else None
+            eval_splits.append((f'env{env_i}_in', in_, in_weights))
+            eval_splits.append((f'env{env_i}_out', out, out_weights))
+        else:
+            train_splits.append((env_i, in_, in_weights))
+            eval_splits.append((f'env{env_i}_out', out, out_weights))
+
     if args.task == "domain_adaptation" and len(uda_splits) == 0:
         raise ValueError("Not enough unlabeled samples for domain adaptation.")
-    train_loaders = [InfiniteDataLoader(dataset=env, weights=env_weights, batch_size=hparams['batch_size'], num_workers=dataset.N_WORKERS) for i, (env, env_weights) in enumerate(in_splits) if i not in args.test_envs]
-    uda_loaders = [InfiniteDataLoader(dataset=env, weights=env_weights, batch_size=hparams['batch_size'], num_workers=dataset.N_WORKERS) for i, (env, env_weights) in enumerate(uda_splits)]
-    eval_loaders = [FastDataLoader(dataset=env, batch_size=64, num_workers=dataset.N_WORKERS) for env, _ in (in_splits + out_splits + uda_splits)]
-    eval_weights = [None for _, weights in (in_splits + out_splits + uda_splits)]
-    eval_loader_names = ['env{}_in'.format(i) for i in range(len(in_splits))]
-    eval_loader_names += ['env{}_out'.format(i) for i in range(len(out_splits))]
-    eval_loader_names += ['env{}_uda'.format(i) for i in range(len(uda_splits))]
+    train_loaders = [InfiniteDataLoader(dataset=env, weights=env_weights, batch_size=hparams['batch_size'], num_workers=dataset.N_WORKERS) for _, env, env_weights in train_splits]
+    uda_loaders = [InfiniteDataLoader(dataset=env, weights=env_weights, batch_size=hparams['batch_size'], num_workers=dataset.N_WORKERS) for env, env_weights in uda_splits]
+    eval_loaders = [FastDataLoader(dataset=env, batch_size=64, num_workers=dataset.N_WORKERS) for _, env, _ in eval_splits]
+    eval_weights = [weights for _, _, weights in eval_splits]
+    eval_loader_names = [name for name, _, _ in eval_splits]
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
-    algorithm = algorithm_class(dataset.input_shape, dataset.num_classes, len(dataset) - len(args.test_envs), hparams)
+    algorithm = algorithm_class(dataset.input_shape, dataset.num_classes, len(train_loaders), hparams)
     if algorithm_dict is not None:
         algorithm.load_state_dict(algorithm_dict)
     algorithm.to(device)
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
-    steps_per_epoch = min([len(env)/hparams['batch_size'] for env,_ in in_splits])
+    steps_per_epoch = min([len(env)/hparams['batch_size'] for _, env, _ in train_splits])
     n_steps = args.steps or dataset.N_STEPS
     checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
 
     def save_checkpoint(filename):
         if args.skip_model_save:
             return
-        save_dict = {"args": vars(args), "model_input_shape": dataset.input_shape, "model_num_classes": dataset.num_classes, "model_num_domains": len(dataset) - len(args.test_envs), "model_hparams": hparams, "model_dict": algorithm.state_dict()}
+        save_dict = {"args": vars(args), "model_input_shape": dataset.input_shape, "model_num_classes": dataset.num_classes, "model_num_domains": len(train_loaders), "model_hparams": hparams, "model_dict": algorithm.state_dict()}
         torch.save(save_dict, os.path.join(args.output_dir, filename))
 
     last_results_keys = None

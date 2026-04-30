@@ -181,6 +181,10 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('weight_decay_g', 0., lambda r: 0.)
     elif algorithm in ['DANN', 'CDANN']:
         _hparam('weight_decay_g', 0., lambda r: 10**r.uniform(-6, -2))
+    if dataset == "OpenSetDomainNetObjects":
+        _hparam('open_set_ood_ratio', 0.5, lambda r: r.choice([0.25, 0.5, 0.75]))
+        _hparam('open_set_max_ood_per_source', 5000, lambda r: int(r.choice([2000, 5000, 10000])))
+        _hparam('open_set_id_classes', 6, lambda r: 6)
     return hparams
 
 def default_hparams(algorithm, dataset):
