@@ -9,6 +9,7 @@ from torchvision.datasets import MNIST, ImageFolder
 from torchvision.transforms.functional import rotate
 from wilds.datasets.camelyon17_dataset import Camelyon17Dataset
 from wilds.datasets.fmow_dataset import FMoWDataset
+from domainbed.lib.openset_manifest import load_samples, load_uid_split, index_samples_by_uid, select_samples
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -257,6 +258,34 @@ class SimpleImageListDataset(Dataset):
         return self.samples[index]
 
 
+class ManifestLabeledDataset(SimpleImageListDataset):
+    pass
+
+
+class ManifestEvalDataset(SimpleImageListDataset):
+    pass
+
+
+class ManifestUnlabeledDataset(Dataset):
+    def __init__(self, samples, weak_transform=None, strong_transform=None, mask_transform=None):
+        self.samples = samples
+        self.weak_transform = weak_transform
+        self.strong_transform = strong_transform
+        self.mask_transform = mask_transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        image = Image.open(sample["path"]).convert("RGB")
+        x_weak = self.weak_transform(image) if self.weak_transform else image
+        x_strong = self.strong_transform(image) if self.strong_transform else x_weak
+        x_mask = self.mask_transform(image) if self.mask_transform else x_weak
+        y_true = torch.tensor(sample["label"], dtype=torch.long)
+        return x_weak, x_strong, x_mask, y_true, sample["uid"]
+
+
 def collect_imagefolder_samples(root, keep_classes=None, label_map=None):
     dataset = ImageFolder(root=root)
     samples = []
@@ -435,6 +464,38 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
 
     def __init__(self, root, test_envs, hparams):
         super().__init__()
+        manifest_root = os.path.join(root, "openset_domainnet_objects_v1")
+        if not os.path.isdir(manifest_root):
+            raise FileNotFoundError(f"Missing benchmark manifest root: {manifest_root}. Build it with scripts/build_openset_domainnet.py")
+        self.id_classes = ["book", "clock", "keyboard", "lamp", "mug", "scissors"]
+        self.num_classes = len(self.id_classes)
+        eval_t = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        label_t = transforms.Compose([transforms.RandomResizedCrop(224, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        weak_t = transforms.Compose([transforms.Resize((224, 224)), transforms.RandomHorizontalFlip(), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        strong_t = transforms.Compose([transforms.RandomResizedCrop(224, scale=(0.5, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.4, 0.4, 0.4, 0.2), transforms.RandomGrayscale(p=0.2), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        mask_t = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        samples = load_samples(os.path.join(manifest_root, "samples.jsonl"))
+        by_uid = index_samples_by_uid(samples)
+        rho = hparams.get("open_set_ood_ratio", 0.5)
+        split_dir = os.path.join(manifest_root, "splits")
+        split_map = {
+            "A_real_train.json": (ManifestLabeledDataset, label_t),
+            "A_painting_train.json": (ManifestLabeledDataset, label_t),
+            f"B_mix_train_rho{rho:.2f}.json": (ManifestUnlabeledDataset, (weak_t, strong_t, mask_t)),
+            "B_id_eval.json": (ManifestEvalDataset, eval_t),
+            "B_ood_eval.json": (ManifestEvalDataset, eval_t),
+            "T_clipart_eval.json": (ManifestEvalDataset, eval_t),
+        }
+        self.datasets = []
+        for split_name, (cls, tfm) in split_map.items():
+            uids = load_uid_split(os.path.join(split_dir, split_name))
+            rows = select_samples(by_uid, uids)
+            if cls is ManifestUnlabeledDataset:
+                self.datasets.append(cls(rows, weak_transform=tfm[0], strong_transform=tfm[1], mask_transform=tfm[2]))
+            else:
+                self.datasets.append(cls(rows, transform=tfm))
+        self.input_shape = self.INPUT_SHAPE
+        return
         self.id_classes = ["book", "clock", "keyboard", "lamp", "mug", "scissors"]
         self.num_classes = len(self.id_classes)
         label_map = {name: idx for idx, name in enumerate(self.id_classes)}
@@ -556,5 +617,3 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
         print("[OpenSetDomainNetObjects] B_ood_eval:", len(ood_eval))
         print("[OpenSetDomainNetObjects] B_mix:", len(b_mix_samples))
         print("[OpenSetDomainNetObjects] T_clipart:", len(t_clipart_samples))
-
-

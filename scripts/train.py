@@ -15,6 +15,7 @@ from domainbed import datasets
 from domainbed import hparams_registry
 from domainbed import algorithms
 from domainbed.lib import misc
+from domainbed.lib import openset_eval
 from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
 
 def unpack_batch(batch):
@@ -25,6 +26,17 @@ def unpack_batch(batch):
         x, y = batch
         return x, y, None
     raise ValueError(f"Unexpected batch structure: {len(batch)}")
+
+
+def batch_to_device_labeled(batch, device):
+    x, y, uid = unpack_batch(batch)
+    return {"x": x.to(device), "y": y.to(device), "uid": uid}
+
+
+def batch_to_device_unlabeled(batch, device):
+    x, y, uid = unpack_batch(batch)
+    x = x.to(device)
+    return {"x_weak": x, "x_strong": x, "x_mask": x, "y_true": y.to(device), "uid": uid}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Domain generalization')
@@ -83,6 +95,9 @@ if __name__ == "__main__":
         dataset = vars(datasets)[args.dataset](args.data_dir, args.test_envs, hparams)
     else:
         raise NotImplementedError
+    if args.dataset == "OpenSetDomainNetObjects" and args.algorithm == "UltimateIRM":
+        assert args.task == "domain_adaptation", \
+            "UltimateIRM on OpenSetDomainNetObjects must run with --task domain_adaptation"
     unlabeled_envs = set(getattr(dataset, "UNLABELED_ENVS", []))
     eval_only_envs = set(getattr(dataset, "EVAL_ONLY_ENVS", []))
     ood_eval_envs = set(getattr(dataset, "OOD_EVAL_ENVS", []))
@@ -170,25 +185,24 @@ if __name__ == "__main__":
     for step in range(start_step, n_steps):
         step_start_time = time.time()
         raw_minibatches = next(train_minibatches_iterator)
-        minibatches_device = []
-        for batch in raw_minibatches:
-            x, y, uid = unpack_batch(batch)
-            if args.dataset == "OpenSetDomainNetObjects":
-                minibatches_device.append((x.to(device), y.to(device), uid))
-            else:
-                minibatches_device.append((x.to(device), y.to(device)))
+        if args.dataset == "OpenSetDomainNetObjects":
+            minibatches_device = [batch_to_device_labeled(b, device) for b in raw_minibatches]
+        else:
+            minibatches_device = [(x.to(device), y.to(device)) for x, y in raw_minibatches]
         if args.task == "domain_adaptation":
             raw_uda_batches = next(uda_minibatches_iterator)
-            uda_device = []
-            for batch in raw_uda_batches:
-                x, y, uid = unpack_batch(batch)
-                if args.dataset == "OpenSetDomainNetObjects":
-                    uda_device.append((x.to(device), y.to(device), uid))
-                else:
-                    uda_device.append((x.to(device), y.to(device)))
+            if args.dataset == "OpenSetDomainNetObjects":
+                uda_device = [batch_to_device_unlabeled(b, device) for b in raw_uda_batches]
+            else:
+                uda_device = [(x.to(device), y.to(device)) for x, y in raw_uda_batches]
         else:
             uda_device = None
-        step_vals = algorithm.update(minibatches_device, uda_device)
+        if hasattr(algorithm, "needs_env_refresh") and algorithm.needs_env_refresh(step):
+            algorithm.refresh_unlabeled_environments(uda_full_loaders=uda_full_loaders, device=device, step=step)
+        try:
+            step_vals = algorithm.update(minibatches=minibatches_device, unlabeled=uda_device, step=step)
+        except TypeError:
+            step_vals = algorithm.update(minibatches_device, uda_device)
         checkpoint_vals['step_time'].append(time.time() - step_start_time)
         for key, val in step_vals.items():
             checkpoint_vals[key].append(val)
@@ -196,10 +210,19 @@ if __name__ == "__main__":
             results = {'step': step, 'epoch': step / steps_per_epoch,}
             for key, val in checkpoint_vals.items():
                 results[key] = np.mean(val)
-            evals = zip(eval_loader_names, eval_loaders, eval_weights)
+            evals = list(zip(eval_loader_names, eval_loaders, eval_weights))
+            id_loader_for_ood = None
+            ood_loader = None
             for name, loader, weights in evals:
-                acc = misc.accuracy(algorithm, loader, weights, device)
-                results[name+'_acc'] = acc
+                if "env3" in name:
+                    id_loader_for_ood = loader
+                if "env4" in name:
+                    ood_loader = loader
+                if "ood" in name.lower() or "env4" in name:
+                    continue
+                results[name+'_acc'] = misc.accuracy(algorithm, loader, weights, device)
+            if id_loader_for_ood is not None and ood_loader is not None:
+                results.update(openset_eval.evaluate_ood(algorithm, id_loader_for_ood, ood_loader, device))
             results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
             results_keys = sorted(results.keys())
             if results_keys != last_results_keys:
