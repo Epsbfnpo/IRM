@@ -247,11 +247,14 @@ class SimpleImageListDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        path, label = self.samples[index]
-        image = Image.open(path).convert("RGB")
+        sample = self.samples[index]
+        image = Image.open(sample["path"]).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        return image, torch.tensor(label, dtype=torch.long)
+        return image, torch.tensor(sample["label"], dtype=torch.long)
+
+    def get_metadata(self, index):
+        return self.samples[index]
 
 
 def collect_imagefolder_samples(root, keep_classes=None, label_map=None):
@@ -269,6 +272,19 @@ def collect_imagefolder_samples(root, keep_classes=None, label_map=None):
     return samples
 
 
+
+
+def wrap_samples(raw_samples, env_name, source_name, is_ood):
+    wrapped = []
+    for path, label in raw_samples:
+        wrapped.append({
+            "path": path,
+            "label": label,
+            "is_ood": is_ood,
+            "source": source_name,
+            "env": env_name
+        })
+    return wrapped
 def sample_n(samples, n, seed=0):
     rng = random.Random(seed)
     samples = list(samples)
@@ -410,8 +426,10 @@ class SpawriousM2M_hard(SpawriousBenchmark):
 
 class OpenSetDomainNetObjects(MultipleDomainDataset):
     CHECKPOINT_FREQ = 1000
-    ENVIRONMENTS = ["A_real", "A_paint", "B_mix", "T_clip"]
+    ENVIRONMENTS = ["A_real", "A_painting", "B_mix", "B_id_eval", "B_ood_eval", "T_clipart"]
     UNLABELED_ENVS = [2]
+    EVAL_ONLY_ENVS = [3, 4, 5]
+    OOD_EVAL_ENVS = [4]
     INPUT_SHAPE = (3, 224, 224)
 
     def __init__(self, root, test_envs, hparams):
@@ -423,17 +441,46 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
         transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
         augment_transform = transforms.Compose([transforms.RandomResizedCrop(224, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 
-        a_real_samples = collect_imagefolder_samples(os.path.join(root, "domain_net", "real"), keep_classes=self.id_classes, label_map=label_map)
-        a_paint_samples = collect_imagefolder_samples(os.path.join(root, "domain_net", "paint"), keep_classes=self.id_classes, label_map=label_map)
-        b_id_samples = collect_imagefolder_samples(os.path.join(root, "domain_net", "sketch"), keep_classes=self.id_classes, label_map=label_map)
-        t_samples = collect_imagefolder_samples(os.path.join(root, "domain_net", "clip"), keep_classes=self.id_classes, label_map=label_map)
+        required_dirs = [
+            os.path.join(root, "domain_net", "real"),
+            os.path.join(root, "domain_net", "painting"),
+            os.path.join(root, "domain_net", "sketch"),
+            os.path.join(root, "domain_net", "clipart"),
+        ]
+        for d in required_dirs:
+            assert os.path.isdir(d), f"Missing required directory: {d}"
 
-        terra_samples = [(path, -1) for path, _ in collect_imagefolder_samples(os.path.join(root, "terra_incognita", "L100"))]
-        sviro_samples = [(path, -1) for path, _ in collect_imagefolder_samples(os.path.join(root, "sviro", "aclass"))]
+        raw_a_real = collect_imagefolder_samples(os.path.join(root, "domain_net", "real"), keep_classes=self.id_classes, label_map=label_map)
+        raw_a_painting = collect_imagefolder_samples(os.path.join(root, "domain_net", "painting"), keep_classes=self.id_classes, label_map=label_map)
+        raw_b_id = collect_imagefolder_samples(os.path.join(root, "domain_net", "sketch"), keep_classes=self.id_classes, label_map=label_map)
+        raw_t_clipart = collect_imagefolder_samples(os.path.join(root, "domain_net", "clipart"), keep_classes=self.id_classes, label_map=label_map)
 
-        spaw_root = os.path.join(root, "spawrious224")
+        assert len(raw_a_real) > 0, "A_real is empty"
+        assert len(raw_a_painting) > 0, "A_painting is empty"
+        assert len(raw_b_id) > 0, "B_id is empty"
+        assert len(raw_t_clipart) > 0, "T_clipart is empty"
+
+        a_real_samples = wrap_samples(raw_a_real, "A_real", "DomainNet", False)
+        a_painting_samples = wrap_samples(raw_a_painting, "A_painting", "DomainNet", False)
+        t_clipart_samples = wrap_samples(raw_t_clipart, "T_clipart", "DomainNet", False)
+        b_id_all = wrap_samples(raw_b_id, "B_id", "DomainNet", False)
+
+        terra_samples = []
+        terra_root = os.path.join(root, "terra_incognita", "location_100")
+        if os.path.isdir(terra_root):
+            raw_terra = collect_imagefolder_samples(terra_root)
+            terra_samples = wrap_samples([(path, -1) for path, _ in raw_terra], "B_ood", "TerraIncognita", True)
+
+        sviro_samples = []
+        sviro_root = os.path.join(root, "sviro", "aclass")
+        if os.path.isdir(sviro_root):
+            raw_sviro = collect_imagefolder_samples(sviro_root)
+            sviro_samples = wrap_samples([(path, -1) for path, _ in raw_sviro], "B_ood", "SVIRO", True)
+
         spaw_samples = []
+        spaw_root = os.path.join(root, "spawrious224")
         if os.path.isdir(spaw_root):
+            raw_spaw = []
             for split in sorted(os.listdir(spaw_root)):
                 split_root = os.path.join(spaw_root, split)
                 if not os.path.isdir(split_root):
@@ -442,28 +489,65 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
                     location_root = os.path.join(split_root, location)
                     if not os.path.isdir(location_root):
                         continue
-                    spaw_samples.extend([(path, -1) for path, _ in collect_imagefolder_samples(location_root)])
+                    raw_spaw.extend(collect_imagefolder_samples(location_root))
+            spaw_samples = wrap_samples([(path, -1) for path, _ in raw_spaw], "B_ood", "Spawrious224", True)
 
-        ood_all = terra_samples + sviro_samples + spaw_samples
-        rho = hparams.get("open_set_ood_ratio", 0.5)
         max_ood_per_source = hparams.get("open_set_max_ood_per_source", 5000)
         if max_ood_per_source is not None:
             terra_samples = sample_n(terra_samples, min(max_ood_per_source, len(terra_samples)), seed=1)
             sviro_samples = sample_n(sviro_samples, min(max_ood_per_source, len(sviro_samples)), seed=2)
             spaw_samples = sample_n(spaw_samples, min(max_ood_per_source, len(spaw_samples)), seed=3)
-            ood_all = terra_samples + sviro_samples + spaw_samples
 
-        num_id = len(b_id_samples)
+        ood_all = terra_samples + sviro_samples + spaw_samples
+        assert len(ood_all) > 0, "No OOD samples were found."
+
+        rng = random.Random(0)
+        rng.shuffle(b_id_all)
+        b_id_split = int(0.8 * len(b_id_all))
+        b_id_train = b_id_all[:b_id_split]
+        b_id_eval = b_id_all[b_id_split:]
+
+        rng.shuffle(ood_all)
+        ood_split = int(0.8 * len(ood_all))
+        ood_train_pool = ood_all[:ood_split]
+        ood_eval = ood_all[ood_split:]
+
+        rho = hparams.get("open_set_ood_ratio", 0.5)
+        assert 0.0 <= rho < 1.0, f"Invalid open_set_ood_ratio: {rho}"
+
+        num_id = len(b_id_train)
         num_ood = int(num_id * rho / max(1e-8, (1 - rho)))
-        ood_samples = sample_n(ood_all, min(num_ood, len(ood_all)), seed=0)
+        ood_selected = sample_n(ood_train_pool, min(num_ood, len(ood_train_pool)), seed=4)
 
-        b_mix_samples = b_id_samples + ood_samples
-        random.Random(0).shuffle(b_mix_samples)
+        b_mix_samples = b_id_train + ood_selected
+        rng.shuffle(b_mix_samples)
+
+        for s in b_id_eval:
+            s["env"] = "B_id_eval"
+        for s in ood_eval:
+            s["env"] = "B_ood_eval"
 
         self.datasets = [
             SimpleImageListDataset(a_real_samples, transform=augment_transform),
-            SimpleImageListDataset(a_paint_samples, transform=augment_transform),
+            SimpleImageListDataset(a_painting_samples, transform=augment_transform),
             SimpleImageListDataset(b_mix_samples, transform=transform),
-            SimpleImageListDataset(t_samples, transform=transform),
+            SimpleImageListDataset(b_id_eval, transform=transform),
+            SimpleImageListDataset(ood_eval, transform=transform),
+            SimpleImageListDataset(t_clipart_samples, transform=transform),
         ]
         self.input_shape = self.INPUT_SHAPE
+
+        print("[OpenSetDomainNetObjects] ID classes:", self.id_classes)
+        print("[OpenSetDomainNetObjects] A_real:", len(a_real_samples))
+        print("[OpenSetDomainNetObjects] A_painting:", len(a_painting_samples))
+        print("[OpenSetDomainNetObjects] B_id_train:", len(b_id_train))
+        print("[OpenSetDomainNetObjects] B_id_eval:", len(b_id_eval))
+        print("[OpenSetDomainNetObjects] Terra OOD:", len(terra_samples))
+        print("[OpenSetDomainNetObjects] SVIRO OOD:", len(sviro_samples))
+        print("[OpenSetDomainNetObjects] Spawrious OOD:", len(spaw_samples))
+        print("[OpenSetDomainNetObjects] OOD selected for B_mix:", len(ood_selected))
+        print("[OpenSetDomainNetObjects] B_ood_eval:", len(ood_eval))
+        print("[OpenSetDomainNetObjects] B_mix:", len(b_mix_samples))
+        print("[OpenSetDomainNetObjects] T_clipart:", len(t_clipart_samples))
+
+

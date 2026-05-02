@@ -75,16 +75,22 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
     unlabeled_envs = set(getattr(dataset, "UNLABELED_ENVS", []))
+    eval_only_envs = set(getattr(dataset, "EVAL_ONLY_ENVS", []))
+    ood_eval_envs = set(getattr(dataset, "OOD_EVAL_ENVS", []))
     test_envs = set(args.test_envs)
     train_splits = []
     eval_splits = []
     uda_splits = []
     for env_i, env in enumerate(dataset):
         if env_i in unlabeled_envs:
-            uda_weights = misc.make_weights_for_balanced_classes(env) if hparams['class_balanced'] else None
-            uda_splits.append((env, uda_weights))
-            eval_splits.append((f'env{env_i}_uda', env, uda_weights))
+            uda_splits.append((env, None))
             continue
+
+        if env_i in eval_only_envs:
+            if env_i not in ood_eval_envs:
+                eval_splits.append((f'env{env_i}_full', env, None))
+            continue
+
         out, in_ = misc.split_dataset(env, int(len(env)*args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
         if hparams['class_balanced']:
             in_weights = misc.make_weights_for_balanced_classes(in_)
@@ -92,19 +98,8 @@ if __name__ == "__main__":
         else:
             in_weights, out_weights = None, None
 
-        if env_i in test_envs:
-            if args.task == "domain_adaptation" and args.uda_holdout_fraction > 0:
-                uda_subset, in_ = misc.split_dataset(in_, int(len(in_)*args.uda_holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
-                uda_subset_weights = misc.make_weights_for_balanced_classes(uda_subset) if hparams['class_balanced'] else None
-                if len(uda_subset):
-                    uda_splits.append((uda_subset, uda_subset_weights))
-                    eval_splits.append((f'env{env_i}_uda', uda_subset, uda_subset_weights))
-                    in_weights = misc.make_weights_for_balanced_classes(in_) if hparams['class_balanced'] else None
-            eval_splits.append((f'env{env_i}_in', in_, in_weights))
-            eval_splits.append((f'env{env_i}_out', out, out_weights))
-        else:
-            train_splits.append((env_i, in_, in_weights))
-            eval_splits.append((f'env{env_i}_out', out, out_weights))
+        train_splits.append((env_i, in_, in_weights))
+        eval_splits.append((f'env{env_i}_out', out, out_weights))
 
     if args.task == "domain_adaptation" and len(uda_splits) == 0:
         raise ValueError("Not enough unlabeled samples for domain adaptation.")
