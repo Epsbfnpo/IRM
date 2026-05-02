@@ -79,3 +79,42 @@ def cluster_C(features, k, seed=0, **kwargs):
 
 def run_clustering(mode, features, k, seed=0, **kwargs):
     return {"A": cluster_A, "B": cluster_B, "C": cluster_C}[mode](features, k, seed=seed, **kwargs)
+
+
+class GuidedTMPMasker:
+    def __init__(self, patch_size=32, topk_ratio=0.4, mask_ratio=0.5):
+        self.patch_size = patch_size
+        self.topk_ratio = topk_ratio
+        self.mask_ratio = mask_ratio
+
+    def apply(self, x, confidence):
+        # patch-level saliency proxy: channel-energy map
+        b, c, h, w = x.shape
+        p = self.patch_size
+        out = x.clone()
+        for i in range(b):
+            if confidence[i] <= 0:
+                continue
+            xi = out[i]
+            patches = xi.unfold(1, p, p).unfold(2, p, p)  # [c, ph, pw, p, p]
+            ph, pw = patches.shape[1], patches.shape[2]
+            energy = patches.abs().mean(dim=(0, 3, 4)).reshape(-1)
+            k = max(1, int(len(energy) * self.topk_ratio))
+            top_idx = torch.topk(energy, k=k).indices
+            m = max(1, int(k * self.mask_ratio))
+            chosen = top_idx[torch.randperm(k, device=top_idx.device)[:m]]
+            for idx in chosen.tolist():
+                r, col = divmod(idx, pw)
+                xi[:, r * p:(r + 1) * p, col * p:(col + 1) * p] = 0.0
+        return out
+
+
+def compute_env_weights(unlabeled_cluster_sizes, lambda_unlabeled=1.0, size_norm=True):
+    if len(unlabeled_cluster_sizes) == 0:
+        return {}
+    if not size_norm:
+        w = lambda_unlabeled / len(unlabeled_cluster_sizes)
+        return {k: w for k in unlabeled_cluster_sizes}
+    inv = {k: 1.0 / max(1, v) for k, v in unlabeled_cluster_sizes.items()}
+    z = sum(inv.values()) + 1e-8
+    return {k: lambda_unlabeled * inv[k] / z for k in inv}

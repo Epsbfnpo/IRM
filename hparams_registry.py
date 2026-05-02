@@ -193,6 +193,20 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam("ultimateirm_tmp_conf_thresh", 0.9, lambda r: float(r.choice([0.8, 0.9, 0.95])))
         _hparam("ultimateirm_lambda_labeled", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
         _hparam("ultimateirm_lambda_unlabeled", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
+        _hparam("ultimateirm_lambda_u_strong", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
+        _hparam("ultimateirm_lambda_u_mask", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
+        _hparam("ultimateirm_min_cluster_size", 4, lambda r: int(r.choice([2, 4, 8])))
+        _hparam("ultimateirm_memory_momentum", 0.9, lambda r: float(r.choice([0.8, 0.9, 0.95])))
+        _hparam("ultimateirm_temporal_gamma", 5.0, lambda r: float(r.choice([2.0, 5.0, 10.0])))
+        _hparam("ultimateirm_resdisp_beta", 5.0, lambda r: float(r.choice([2.0, 5.0, 10.0])))
+        _hparam("ultimateirm_resdisp_thresh", 0.05, lambda r: float(r.choice([0.02, 0.05, 0.1])))
+        _hparam("ultimateirm_conf_w_max", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
+        _hparam("ultimateirm_conf_w_tmp", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
+        _hparam("ultimateirm_conf_w_res", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
+        _hparam("ultimateirm_tmp_patch_size", 32, lambda r: int(r.choice([16, 32])))
+        _hparam("ultimateirm_tmp_topk_ratio", 0.4, lambda r: float(r.choice([0.3, 0.4, 0.5])))
+        _hparam("ultimateirm_tmp_mask_ratio", 0.5, lambda r: float(r.choice([0.3, 0.5, 0.7])))
+        _hparam("ultimateirm_size_norm", True, lambda r: bool(r.choice([True, False])))
     return hparams
 
 def default_hparams(algorithm, dataset):

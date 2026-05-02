@@ -19,6 +19,9 @@ from domainbed.lib import openset_eval
 from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
 
 def unpack_batch(batch):
+    if len(batch) == 5:
+        x_weak, x_strong, x_mask, y_true, uid = batch
+        return x_weak, x_strong, x_mask, y_true, uid
     if len(batch) == 3:
         x, y, uid = batch
         return x, y, uid
@@ -34,9 +37,8 @@ def batch_to_device_labeled(batch, device):
 
 
 def batch_to_device_unlabeled(batch, device):
-    x, y, uid = unpack_batch(batch)
-    x = x.to(device)
-    return {"x_weak": x, "x_strong": x, "x_mask": x, "y_true": y.to(device), "uid": uid}
+    x_weak, x_strong, x_mask, y_true, uid = unpack_batch(batch)
+    return {"x_weak": x_weak.to(device), "x_strong": x_strong.to(device), "x_mask": x_mask.to(device), "y_true": y_true.to(device), "uid": uid}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Domain generalization')
@@ -113,8 +115,7 @@ if __name__ == "__main__":
                 continue
 
             if env_i in eval_only_envs:
-                if env_i not in ood_eval_envs:
-                    eval_splits.append((f'env{env_i}_full', env, None))
+                eval_splits.append((f'env{env_i}_full', env, None))
                 continue
 
             out, in_ = misc.split_dataset(env, int(len(env)*args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
@@ -233,6 +234,8 @@ if __name__ == "__main__":
             epochs_path = os.path.join(args.output_dir, 'results.jsonl')
             with open(epochs_path, 'a') as f:
                 f.write(json.dumps(results, sort_keys=True) + "\n")
+            if hasattr(algorithm, "export_diagnostics"):
+                algorithm.export_diagnostics(output_dir=args.output_dir, step=step)
             algorithm_dict = algorithm.state_dict()
             start_step = step + 1
             checkpoint_vals = collections.defaultdict(lambda: [])

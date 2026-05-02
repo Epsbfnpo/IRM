@@ -6,7 +6,7 @@ from sklearn.cluster import KMeans
 import torchvision.transforms as T
 import copy
 import numpy as np
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 try:
     from backpack import backpack, extend
     from backpack.extensions import BatchGrad
@@ -15,7 +15,7 @@ except:
 from domainbed import networks
 from domainbed.lib import wide_resnet
 from domainbed.lib.misc import random_pairs_of_minibatches, split_meta_train_test, ParamDict, MovingAverage, ErmPlusPlusMovingAvg, l2_between_dicts, proj, Nonparametric, LARS, SupConLossLambda
-from domainbed.lib.ultimateirm_utils import TemporalMemoryBank, compute_confidence, run_clustering
+from domainbed.lib.ultimateirm_utils import TemporalMemoryBank, compute_confidence, run_clustering, GuidedTMPMasker, compute_env_weights
 
 ALGORITHMS = ['ERM', 'ERMPlusPlus', 'Fish', 'IRM', 'GroupDRO', 'Mixup', 'MLDG', 'CORAL', 'MMD', 'DANN', 'CDANN', 'MTL', 'SagNet', 'ARM', 'VREx', 'RSC', 'SD', 'ANDMask', 'SANDMask', 'IGA', 'SelfReg', 'Fishr', 'TRM', 'IB_ERM', 'IB_IRM', 'CAD', 'CondCAD', 'Transfer', 'CausIRL_CORAL', 'CausIRL_MMD', 'EQRM', 'RDM', 'ADRMX', 'URM', 'UltimateIRM',]
 
@@ -1567,9 +1567,14 @@ class UltimateIRM(ERM):
         self.register_buffer('update_count', torch.tensor([0]))
         self.memory_bank = TemporalMemoryBank(num_classes, momentum=self.hparams.get("ultimateirm_memory_momentum", 0.9))
         self.env_assignments = {}
+        self.cluster_sizes = {}
         self.last_env_refresh_step = -1
         self.stage = "warmup"
-        self.tmp_masker = T.RandomErasing(p=1.0, scale=(0.1, 0.3), ratio=(0.5, 2.0), value='random')
+        self.tmp_masker = GuidedTMPMasker(
+            patch_size=self.hparams.get("ultimateirm_tmp_patch_size", 32),
+            topk_ratio=self.hparams.get("ultimateirm_tmp_topk_ratio", 0.4),
+            mask_ratio=self.hparams.get("ultimateirm_tmp_mask_ratio", 0.5),
+        )
 
     def _irm_penalty_single_env(self, logits, y, w):
         if logits.shape[0] < 2:
@@ -1602,6 +1607,7 @@ class UltimateIRM(ERM):
         pseudo, conf = compute_confidence(self.hparams.get("ultimateirm_confidence_mode", "A"), probs_t, uid_list=uids, memory_bank=self.memory_bank, gamma=self.hparams.get("ultimateirm_temporal_gamma", 5.0), beta=self.hparams.get("ultimateirm_resdisp_beta", 5.0), dispersion_thresh=self.hparams.get("ultimateirm_resdisp_thresh", 0.05), w_max=self.hparams.get("ultimateirm_conf_w_max", 1.0), w_tmp=self.hparams.get("ultimateirm_conf_w_tmp", 1.0), w_res=self.hparams.get("ultimateirm_conf_w_res", 1.0))
         cluster_ids, _ = run_clustering(self.hparams.get("ultimateirm_cluster_mode", "A"), feats_np, self.hparams.get("ultimateirm_k", 3), seed=0)
         for uid, cid in zip(uids, cluster_ids): self.env_assignments[uid] = int(cid)
+        self.cluster_sizes = dict(Counter([int(c) for c in cluster_ids]))
         self.memory_bank.update(uids, probs_t, pseudo, conf, cluster_ids=cluster_ids)
         self.last_env_refresh_step = step; self.stage = "causal_optimization"
 
@@ -1627,20 +1633,32 @@ class UltimateIRM(ERM):
             mask_u = (conf >= self.hparams.get("ultimateirm_pseudo_conf_thresh", 0.8)).float().to(all_x.device)
             ls = F.cross_entropy(self.predict(xs), pseudo.to(all_x.device), reduction="none")
             loss_u_strong = (ls * mask_u).sum() / (mask_u.sum() + 1e-8)
-            xm_masked = torch.stack([self.tmp_masker(x) if conf[i] >= self.hparams.get("ultimateirm_tmp_conf_thresh", 0.9) else x for i, x in enumerate(xm)])
+            tmp_gate = (conf >= self.hparams.get("ultimateirm_tmp_conf_thresh", 0.9)).to(all_x.device)
+            xm_masked = self.tmp_masker.apply(xm, tmp_gate)
             lm = F.cross_entropy(self.predict(xm_masked), pseudo.to(all_x.device), reduction="none")
             loss_u_mask = (lm * mask_u).sum() / (mask_u.sum() + 1e-8)
             if self.stage == "causal_optimization" and len(self.env_assignments) > 0:
                 envs = torch.tensor([self.env_assignments.get(u, -1) for u in uid], device=all_x.device)
                 logits_s = self.predict(xs)
+                env_weights = compute_env_weights(self.cluster_sizes, lambda_unlabeled=self.hparams.get("ultimateirm_lambda_unlabeled", 1.0), size_norm=self.hparams.get("ultimateirm_size_norm", True))
                 for k in range(self.hparams.get("ultimateirm_k", 3)):
                     mk = envs == k
                     if mk.sum() < self.hparams.get("ultimateirm_min_cluster_size", 4): continue
-                    pen_b = pen_b + self._irm_penalty_single_env(logits_s[mk], pseudo.to(all_x.device)[mk], conf.to(all_x.device)[mk])
+                    pen_b = pen_b + env_weights.get(k, 0.0) * self._irm_penalty_single_env(logits_s[mk], pseudo.to(all_x.device)[mk], conf.to(all_x.device)[mk])
             self.memory_bank.update(uid, pw, pseudo, conf)
             loss = loss + self.hparams.get("ultimateirm_lambda_u_strong", 1.0) * loss_u_strong + self.hparams.get("ultimateirm_lambda_u_mask", 1.0) * loss_u_mask + self.hparams.get("ultimateirm_lambda_unlabeled", 1.0) * pen_b
         self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
         return {"loss_total": float(loss.item()), "loss_sup": float(sup_loss.item()), "loss_u_strong": float(loss_u_strong.item()), "loss_u_mask": float(loss_u_mask.item()), "penalty_a": float(pen_a.item()), "penalty_b": float(pen_b.item()), "stage_id": 0 if self.stage == "warmup" else 2}
+
+    def export_diagnostics(self, output_dir, step):
+        import os, json
+        d = os.path.join(output_dir, "diagnostics", f"step_{step:06d}")
+        os.makedirs(d, exist_ok=True)
+        self.memory_bank.export_csv(os.path.join(d, "memory_bank_snapshot.csv"))
+        with open(os.path.join(d, "env_assignments.json"), "w") as f:
+            json.dump(self.env_assignments, f)
+        with open(os.path.join(d, "cluster_stats.json"), "w") as f:
+            json.dump({"cluster_sizes": self.cluster_sizes, "stage": self.stage}, f)
 
     def predict(self, x):
         return self.network(x)
