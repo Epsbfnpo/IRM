@@ -87,22 +87,36 @@ class GuidedTMPMasker:
         self.topk_ratio = topk_ratio
         self.mask_ratio = mask_ratio
 
-    def apply(self, x, confidence):
-        # patch-level saliency proxy: channel-energy map
+    def apply(self, x, apply_mask):
+        """
+        x: Tensor [B, C, H, W]
+        apply_mask: BoolTensor or FloatTensor [B]
+            True / 1 means this sample can be guided-masked.
+        """
         b, c, h, w = x.shape
         p = self.patch_size
         out = x.clone()
+
+        if not torch.is_tensor(apply_mask):
+            apply_mask = torch.tensor(apply_mask, device=x.device)
+        apply_mask = apply_mask.to(x.device).bool()
+
         for i in range(b):
-            if confidence[i] <= 0:
+            if not bool(apply_mask[i].item()):
                 continue
             xi = out[i]
-            patches = xi.unfold(1, p, p).unfold(2, p, p)  # [c, ph, pw, p, p]
+
+            if h < p or w < p or (h % p != 0) or (w % p != 0):
+                continue
+
+            patches = xi.unfold(1, p, p).unfold(2, p, p)
             ph, pw = patches.shape[1], patches.shape[2]
             energy = patches.abs().mean(dim=(0, 3, 4)).reshape(-1)
             k = max(1, int(len(energy) * self.topk_ratio))
             top_idx = torch.topk(energy, k=k).indices
             m = max(1, int(k * self.mask_ratio))
-            chosen = top_idx[torch.randperm(k, device=top_idx.device)[:m]]
+            perm = torch.randperm(k, device=top_idx.device)[:m]
+            chosen = top_idx[perm]
             for idx in chosen.tolist():
                 r, col = divmod(idx, pw)
                 xi[:, r * p:(r + 1) * p, col * p:(col + 1) * p] = 0.0

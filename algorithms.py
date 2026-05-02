@@ -1746,13 +1746,18 @@ class UltimateIRM(ERM):
             conf_dev = conf.to(all_x.device)
             pseudo_dev = pseudo.to(all_x.device)
 
-            accept_mask = (conf_dev >= self.hparams.get("ultimateirm_pseudo_conf_thresh", 0.8)).float()
+            accept_mask = (
+                conf_dev >= self.hparams.get("ultimateirm_pseudo_conf_thresh", 0.8)
+            ).float()
 
             logits_s = self.predict(xs)
             loss_s = F.cross_entropy(logits_s, pseudo_dev, reduction="none")
             loss_u_strong = (loss_s * accept_mask).sum() / (accept_mask.sum() + 1e-8)
 
-            tmp_masked = self.guided_tmp.apply(xm, conf_dev)
+            tmp_gate = (
+                conf_dev >= self.hparams.get("ultimateirm_tmp_conf_thresh", 0.9)
+            )
+            tmp_masked = self.guided_tmp.apply(xm, tmp_gate)
             logits_m = self.predict(tmp_masked)
             loss_m = F.cross_entropy(logits_m, pseudo_dev, reduction="none")
             loss_u_mask = (loss_m * accept_mask).sum() / (accept_mask.sum() + 1e-8)
@@ -1793,9 +1798,7 @@ class UltimateIRM(ERM):
                 cluster_ids=[self.env_assignments.get(u, -1) for u in uid],
             )
 
-            tmp_applied_mask = (
-                conf_dev >= self.hparams.get("ultimateirm_tmp_conf_thresh", 0.9)
-            )
+            tmp_applied_mask = tmp_gate
 
             for i, u in enumerate(uid):
                 latest_rows.append({
@@ -1877,6 +1880,35 @@ class UltimateIRM(ERM):
                 )
                 writer.writeheader()
                 writer.writerows(self._latest_sample_rows)
+
+    @torch.no_grad()
+    def score_ood(self, x, uid=None):
+        probs = F.softmax(self.predict(x), dim=1)
+        max_probs = probs.max(dim=1)[0]
+        mode = self.hparams.get("ultimateirm_confidence_mode", "A")
+        if uid is None:
+            return 1.0 - max_probs
+        uid_list = list(uid)
+        if mode == "A":
+            _, conf = compute_confidence(mode="A", probs=probs, uid_list=uid_list, memory_bank=self.memory_bank)
+            return 1.0 - conf.to(x.device)
+        if mode == "C":
+            _, conf = compute_confidence(mode="C", probs=probs, uid_list=uid_list, memory_bank=self.memory_bank, beta=self.hparams.get("ultimateirm_resdisp_beta", 5.0), dispersion_thresh=self.hparams.get("ultimateirm_resdisp_thresh", 0.05))
+            return 1.0 - conf.to(x.device)
+        seen_mask = torch.tensor([u in self.memory_bank.store for u in uid_list], device=x.device, dtype=torch.bool)
+        score = 1.0 - max_probs
+        if seen_mask.any():
+            seen_uid = [uid_list[i] for i, m in enumerate(seen_mask.tolist()) if m]
+            if mode == "B":
+                _, conf_seen = compute_confidence(mode="B", probs=probs[seen_mask], uid_list=seen_uid, memory_bank=self.memory_bank, gamma=self.hparams.get("ultimateirm_temporal_gamma", 5.0))
+            else:
+                _, conf_seen = compute_confidence(mode="D", probs=probs[seen_mask], uid_list=seen_uid, memory_bank=self.memory_bank, gamma=self.hparams.get("ultimateirm_temporal_gamma", 5.0), beta=self.hparams.get("ultimateirm_resdisp_beta", 5.0), dispersion_thresh=self.hparams.get("ultimateirm_resdisp_thresh", 0.05), w_max=self.hparams.get("ultimateirm_conf_w_max", 1.0), w_tmp=self.hparams.get("ultimateirm_conf_w_tmp", 1.0), w_res=self.hparams.get("ultimateirm_conf_w_res", 1.0))
+            score[seen_mask] = 1.0 - conf_seen.to(x.device)
+        unseen_mask = ~seen_mask
+        if unseen_mask.any() and mode == "D":
+            _, conf_unseen = compute_confidence(mode="C", probs=probs[unseen_mask], uid_list=None, memory_bank=None, beta=self.hparams.get("ultimateirm_resdisp_beta", 5.0), dispersion_thresh=self.hparams.get("ultimateirm_resdisp_thresh", 0.05))
+            score[unseen_mask] = 1.0 - conf_unseen.to(x.device)
+        return score
 
     def predict(self, x):
         return self.network(x)
