@@ -9,6 +9,7 @@ from torchvision.datasets import MNIST, ImageFolder
 from torchvision.transforms.functional import rotate
 from wilds.datasets.camelyon17_dataset import Camelyon17Dataset
 from wilds.datasets.fmow_dataset import FMoWDataset
+from domainbed.lib.openset_manifest import load_samples, load_uid_split, index_samples_by_uid, select_samples
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -435,6 +436,30 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
 
     def __init__(self, root, test_envs, hparams):
         super().__init__()
+        manifest_root = os.path.join(root, "openset_domainnet_objects_v1")
+        if os.path.isdir(manifest_root):
+            self.id_classes = ["book", "clock", "keyboard", "lamp", "mug", "scissors"]
+            self.num_classes = len(self.id_classes)
+            base_t = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+            aug_t = transforms.Compose([transforms.RandomResizedCrop(224, scale=(0.7, 1.0)), transforms.RandomHorizontalFlip(), transforms.ColorJitter(0.3, 0.3, 0.3, 0.3), transforms.RandomGrayscale(), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+            samples = load_samples(os.path.join(manifest_root, "samples.jsonl"))
+            by_uid = index_samples_by_uid(samples)
+            rho = hparams.get("open_set_ood_ratio", 0.5)
+            split_files = [
+                ("A_real_train.json", aug_t),
+                ("A_painting_train.json", aug_t),
+                (f"B_mix_train_rho{rho:.2f}.json", base_t),
+                ("B_id_eval.json", base_t),
+                ("B_ood_eval.json", base_t),
+                ("T_clipart_eval.json", base_t),
+            ]
+            split_dir = os.path.join(manifest_root, "splits")
+            self.datasets = []
+            for filename, tfm in split_files:
+                uids = load_uid_split(os.path.join(split_dir, filename))
+                self.datasets.append(SimpleImageListDataset(select_samples(by_uid, uids), transform=tfm))
+            self.input_shape = self.INPUT_SHAPE
+            return
         self.id_classes = ["book", "clock", "keyboard", "lamp", "mug", "scissors"]
         self.num_classes = len(self.id_classes)
         label_map = {name: idx for idx, name in enumerate(self.id_classes)}
@@ -556,5 +581,3 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
         print("[OpenSetDomainNetObjects] B_ood_eval:", len(ood_eval))
         print("[OpenSetDomainNetObjects] B_mix:", len(b_mix_samples))
         print("[OpenSetDomainNetObjects] T_clipart:", len(t_clipart_samples))
-
-

@@ -182,8 +182,17 @@ def _hparams(algorithm, dataset, random_seed):
     elif algorithm in ['DANN', 'CDANN']:
         _hparam('weight_decay_g', 0., lambda r: 10**r.uniform(-6, -2))
     if dataset == "OpenSetDomainNetObjects":
-        _hparam('open_set_ood_ratio', 0.5, lambda r: r.choice([0.25, 0.5, 0.75]))
+        _hparam('open_set_ood_ratio', 0.5, lambda r: r.choice([0.0, 0.25, 0.5, 0.75, 0.9]))
         _hparam('open_set_max_ood_per_source', 5000, lambda r: int(r.choice([2000, 5000, 10000])))
+        _hparam("ultimateirm_warmup_steps", 1000, lambda r: int(r.choice([500, 1000, 2000])))
+        _hparam("ultimateirm_env_refresh_freq", 1000, lambda r: int(r.choice([500, 1000, 2000])))
+        _hparam("ultimateirm_confidence_mode", "A", lambda r: r.choice(["A", "B", "C", "D"]))
+        _hparam("ultimateirm_cluster_mode", "A", lambda r: r.choice(["A", "B", "C"]))
+        _hparam("ultimateirm_k", 3, lambda r: int(r.choice([1, 3, 5])))
+        _hparam("ultimateirm_pseudo_conf_thresh", 0.8, lambda r: float(r.choice([0.7, 0.8, 0.9])))
+        _hparam("ultimateirm_tmp_conf_thresh", 0.9, lambda r: float(r.choice([0.8, 0.9, 0.95])))
+        _hparam("ultimateirm_lambda_labeled", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
+        _hparam("ultimateirm_lambda_unlabeled", 1.0, lambda r: float(r.choice([0.5, 1.0, 2.0])))
     return hparams
 
 def default_hparams(algorithm, dataset):
