@@ -251,7 +251,7 @@ class SimpleImageListDataset(Dataset):
         image = Image.open(sample["path"]).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        return image, torch.tensor(sample["label"], dtype=torch.long)
+        return image, torch.tensor(sample["label"], dtype=torch.long), sample["uid"]
 
     def get_metadata(self, index):
         return self.samples[index]
@@ -274,15 +274,16 @@ def collect_imagefolder_samples(root, keep_classes=None, label_map=None):
 
 
 
-def wrap_samples(raw_samples, env_name, source_name, is_ood):
+def wrap_samples(raw_samples, env_name, source_name, is_ood, uid_prefix):
     wrapped = []
-    for path, label in raw_samples:
+    for i, (path, label) in enumerate(raw_samples):
         wrapped.append({
             "path": path,
             "label": label,
             "is_ood": is_ood,
             "source": source_name,
-            "env": env_name
+            "env": env_name,
+            "uid": f"{uid_prefix}:{i}"
         })
     return wrapped
 def sample_n(samples, n, seed=0):
@@ -460,22 +461,22 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
         assert len(raw_b_id) > 0, "B_id is empty"
         assert len(raw_t_clipart) > 0, "T_clipart is empty"
 
-        a_real_samples = wrap_samples(raw_a_real, "A_real", "DomainNet", False)
-        a_painting_samples = wrap_samples(raw_a_painting, "A_painting", "DomainNet", False)
-        t_clipart_samples = wrap_samples(raw_t_clipart, "T_clipart", "DomainNet", False)
-        b_id_all = wrap_samples(raw_b_id, "B_id", "DomainNet", False)
+        a_real_samples = wrap_samples(raw_a_real, "A_real", "DomainNet", False, "A_real")
+        a_painting_samples = wrap_samples(raw_a_painting, "A_painting", "DomainNet", False, "A_painting")
+        t_clipart_samples = wrap_samples(raw_t_clipart, "T_clipart", "DomainNet", False, "T_clipart")
+        b_id_all = wrap_samples(raw_b_id, "B_id", "DomainNet", False, "B_id")
 
         terra_samples = []
         terra_root = os.path.join(root, "terra_incognita", "location_100")
         if os.path.isdir(terra_root):
             raw_terra = collect_imagefolder_samples(terra_root)
-            terra_samples = wrap_samples([(path, -1) for path, _ in raw_terra], "B_ood", "TerraIncognita", True)
+            terra_samples = wrap_samples([(path, -1) for path, _ in raw_terra], "B_ood", "TerraIncognita", True, "Terra")
 
         sviro_samples = []
         sviro_root = os.path.join(root, "sviro", "aclass")
         if os.path.isdir(sviro_root):
             raw_sviro = collect_imagefolder_samples(sviro_root)
-            sviro_samples = wrap_samples([(path, -1) for path, _ in raw_sviro], "B_ood", "SVIRO", True)
+            sviro_samples = wrap_samples([(path, -1) for path, _ in raw_sviro], "B_ood", "SVIRO", True, "SVIRO")
 
         spaw_samples = []
         spaw_root = os.path.join(root, "spawrious224")
@@ -490,7 +491,7 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
                     if not os.path.isdir(location_root):
                         continue
                     raw_spaw.extend(collect_imagefolder_samples(location_root))
-            spaw_samples = wrap_samples([(path, -1) for path, _ in raw_spaw], "B_ood", "Spawrious224", True)
+            spaw_samples = wrap_samples([(path, -1) for path, _ in raw_spaw], "B_ood", "Spawrious224", True, "Spaw")
 
         max_ood_per_source = hparams.get("open_set_max_ood_per_source", 5000)
         if max_ood_per_source is not None:

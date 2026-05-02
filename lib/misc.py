@@ -83,8 +83,8 @@ class MovingAverage:
 def make_weights_for_balanced_classes(dataset):
     counts = Counter()
     classes = []
-    for _, y in dataset:
-        y = int(y)
+    for item in dataset:
+        y = int(item[1])
         counts[y] += 1
         classes.append(y)
     n_classes = len(counts)
@@ -173,9 +173,9 @@ def accuracy(network, loader, weights, device):
     weights_offset = 0
     network.eval()
     with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
+        for batch in loader:
+            x = batch[0].to(device)
+            y = batch[1].to(device)
             p = network.predict(x)
             if weights is None:
                 batch_weights = torch.ones(len(x))

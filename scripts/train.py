@@ -17,6 +17,15 @@ from domainbed import algorithms
 from domainbed.lib import misc
 from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
 
+def unpack_batch(batch):
+    if len(batch) == 3:
+        x, y, uid = batch
+        return x, y, uid
+    if len(batch) == 2:
+        x, y = batch
+        return x, y, None
+    raise ValueError(f"Unexpected batch structure: {len(batch)}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Domain generalization')
     parser.add_argument('--data_dir', type=str)
@@ -133,6 +142,9 @@ if __name__ == "__main__":
         raise ValueError("Not enough unlabeled samples for domain adaptation.")
     train_loaders = [InfiniteDataLoader(dataset=env, weights=env_weights, batch_size=hparams['batch_size'], num_workers=dataset.N_WORKERS) for _, env, env_weights in train_splits]
     uda_loaders = [InfiniteDataLoader(dataset=env, weights=env_weights, batch_size=hparams['batch_size'], num_workers=dataset.N_WORKERS) for env, env_weights in uda_splits]
+    uda_full_loaders = []
+    if args.dataset == "OpenSetDomainNetObjects":
+        uda_full_loaders = [FastDataLoader(dataset=env, batch_size=64, num_workers=dataset.N_WORKERS) for env, _ in uda_splits]
     eval_loaders = [FastDataLoader(dataset=env, batch_size=64, num_workers=dataset.N_WORKERS) for _, env, _ in eval_splits]
     eval_weights = [weights for _, _, weights in eval_splits]
     eval_loader_names = [name for name, _, _ in eval_splits]
@@ -157,9 +169,23 @@ if __name__ == "__main__":
     last_results_keys = None
     for step in range(start_step, n_steps):
         step_start_time = time.time()
-        minibatches_device = [(x.to(device), y.to(device)) for x,y in next(train_minibatches_iterator)]
+        raw_minibatches = next(train_minibatches_iterator)
+        minibatches_device = []
+        for batch in raw_minibatches:
+            x, y, uid = unpack_batch(batch)
+            if args.dataset == "OpenSetDomainNetObjects":
+                minibatches_device.append((x.to(device), y.to(device), uid))
+            else:
+                minibatches_device.append((x.to(device), y.to(device)))
         if args.task == "domain_adaptation":
-            uda_device = [x.to(device) for x,_ in next(uda_minibatches_iterator)]
+            raw_uda_batches = next(uda_minibatches_iterator)
+            uda_device = []
+            for batch in raw_uda_batches:
+                x, y, uid = unpack_batch(batch)
+                if args.dataset == "OpenSetDomainNetObjects":
+                    uda_device.append((x.to(device), y.to(device), uid))
+                else:
+                    uda_device.append((x.to(device), y.to(device)))
         else:
             uda_device = None
         step_vals = algorithm.update(minibatches_device, uda_device)
