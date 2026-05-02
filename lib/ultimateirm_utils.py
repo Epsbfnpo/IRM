@@ -109,12 +109,21 @@ class GuidedTMPMasker:
         return out
 
 
-def compute_env_weights(unlabeled_cluster_sizes, lambda_unlabeled=1.0, size_norm=True):
+def compute_env_weights(
+    num_labeled_envs,
+    unlabeled_cluster_sizes,
+    lambda_labeled=1.0,
+    lambda_unlabeled=1.0,
+    size_norm=True,
+):
+    labeled_weights = {i: (lambda_labeled / max(1, num_labeled_envs)) for i in range(num_labeled_envs)}
     if len(unlabeled_cluster_sizes) == 0:
-        return {}
-    if not size_norm:
+        unlabeled_weights = {}
+    elif not size_norm:
         w = lambda_unlabeled / len(unlabeled_cluster_sizes)
-        return {k: w for k in unlabeled_cluster_sizes}
-    inv = {k: 1.0 / max(1, v) for k, v in unlabeled_cluster_sizes.items()}
-    z = sum(inv.values()) + 1e-8
-    return {k: lambda_unlabeled * inv[k] / z for k in inv}
+        unlabeled_weights = {k: w for k in unlabeled_cluster_sizes}
+    else:
+        inv = {k: 1.0 / max(1, v) for k, v in unlabeled_cluster_sizes.items()}
+        z = sum(inv.values()) + 1e-8
+        unlabeled_weights = {k: lambda_unlabeled * inv[k] / z for k in inv}
+    return labeled_weights, unlabeled_weights

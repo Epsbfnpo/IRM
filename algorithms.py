@@ -1,3 +1,6 @@
+import os
+import json
+import csv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1564,101 +1567,316 @@ class ADRMX(Algorithm):
 class UltimateIRM(ERM):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(UltimateIRM, self).__init__(input_shape, num_classes, num_domains, hparams)
-        self.register_buffer('update_count', torch.tensor([0]))
-        self.memory_bank = TemporalMemoryBank(num_classes, momentum=self.hparams.get("ultimateirm_memory_momentum", 0.9))
+        self.register_buffer("update_count", torch.tensor([0]))
+
+        self.memory_bank = TemporalMemoryBank(
+            num_classes=num_classes,
+            momentum=self.hparams.get("ultimateirm_memory_momentum", 0.9),
+        )
+
         self.env_assignments = {}
-        self.cluster_sizes = {}
         self.last_env_refresh_step = -1
         self.stage = "warmup"
-        self.tmp_masker = GuidedTMPMasker(
+
+        self.guided_tmp = GuidedTMPMasker(
             patch_size=self.hparams.get("ultimateirm_tmp_patch_size", 32),
             topk_ratio=self.hparams.get("ultimateirm_tmp_topk_ratio", 0.4),
             mask_ratio=self.hparams.get("ultimateirm_tmp_mask_ratio", 0.5),
         )
 
+        self._latest_refresh_stats = {}
+        self._latest_sample_rows = []
+
     def _irm_penalty_single_env(self, logits, y, w):
         if logits.shape[0] < 2:
             return torch.tensor(0.0, device=logits.device)
-        scale = torch.tensor(1., device=logits.device).requires_grad_()
-        l1 = F.cross_entropy(logits[::2] * scale, y[::2], reduction='none')
-        l2 = F.cross_entropy(logits[1::2] * scale, y[1::2], reduction='none')
-        w1, w2 = w[::2], w[1::2]
-        l1 = (l1 * w1).sum() / (w1.sum() + 1e-8); l2 = (l2 * w2).sum() / (w2.sum() + 1e-8)
-        g1 = autograd.grad(l1, [scale], create_graph=True)[0]; g2 = autograd.grad(l2, [scale], create_graph=True)[0]
+
+        scale = torch.tensor(1.0, device=logits.device).requires_grad_()
+
+        l1 = F.cross_entropy(logits[::2] * scale, y[::2], reduction="none")
+        l2 = F.cross_entropy(logits[1::2] * scale, y[1::2], reduction="none")
+
+        w1 = w[::2]
+        w2 = w[1::2]
+
+        l1 = (l1 * w1).sum() / (w1.sum() + 1e-8)
+        l2 = (l2 * w2).sum() / (w2.sum() + 1e-8)
+
+        g1 = autograd.grad(l1, [scale], create_graph=True)[0]
+        g2 = autograd.grad(l2, [scale], create_graph=True)[0]
         return torch.sum(g1 * g2)
 
     def needs_env_refresh(self, step):
-        if step < self.hparams.get("ultimateirm_warmup_steps", 1000): return False
-        if self.last_env_refresh_step < 0: return True
-        return (step - self.last_env_refresh_step) >= self.hparams.get("ultimateirm_env_refresh_freq", 1000)
+        warmup_steps = self.hparams.get("ultimateirm_warmup_steps", 1000)
+        refresh_freq = self.hparams.get("ultimateirm_env_refresh_freq", 1000)
+
+        if step < warmup_steps:
+            return False
+        if self.last_env_refresh_step < 0:
+            return True
+        return (step - self.last_env_refresh_step) >= refresh_freq
 
     @torch.no_grad()
     def refresh_unlabeled_environments(self, uda_full_loaders, device, step):
-        feats, probs, uids = [], [], []
         self.eval()
+
+        all_feats = []
+        all_probs = []
+        all_uids = []
+        all_y_true = []
+
         for loader in uda_full_loaders:
             for batch in loader:
-                xw, _, _, y_true, uid = batch
-                xw = xw.to(device)
-                f = self.featurizer(xw); p = F.softmax(self.classifier(f), dim=1)
-                feats.append(f.cpu()); probs.append(p.cpu()); uids.extend(uid)
-        if not uids: return
-        feats_np = torch.cat(feats, dim=0).numpy(); probs_t = torch.cat(probs, dim=0)
-        pseudo, conf = compute_confidence(self.hparams.get("ultimateirm_confidence_mode", "A"), probs_t, uid_list=uids, memory_bank=self.memory_bank, gamma=self.hparams.get("ultimateirm_temporal_gamma", 5.0), beta=self.hparams.get("ultimateirm_resdisp_beta", 5.0), dispersion_thresh=self.hparams.get("ultimateirm_resdisp_thresh", 0.05), w_max=self.hparams.get("ultimateirm_conf_w_max", 1.0), w_tmp=self.hparams.get("ultimateirm_conf_w_tmp", 1.0), w_res=self.hparams.get("ultimateirm_conf_w_res", 1.0))
-        cluster_ids, _ = run_clustering(self.hparams.get("ultimateirm_cluster_mode", "A"), feats_np, self.hparams.get("ultimateirm_k", 3), seed=0)
-        for uid, cid in zip(uids, cluster_ids): self.env_assignments[uid] = int(cid)
-        self.cluster_sizes = dict(Counter([int(c) for c in cluster_ids]))
-        self.memory_bank.update(uids, probs_t, pseudo, conf, cluster_ids=cluster_ids)
-        self.last_env_refresh_step = step; self.stage = "causal_optimization"
+                x_weak, x_strong, x_mask, y_true, uid = batch
+                x_weak = x_weak.to(device)
+
+                feats = self.featurizer(x_weak)
+                logits = self.classifier(feats)
+                probs = F.softmax(logits, dim=1)
+
+                all_feats.append(feats.detach().cpu())
+                all_probs.append(probs.detach().cpu())
+                all_uids.extend(list(uid))
+                all_y_true.append(y_true.detach().cpu())
+
+        if len(all_uids) == 0:
+            return
+
+        feats_np = torch.cat(all_feats, dim=0).numpy()
+        probs_t = torch.cat(all_probs, dim=0)
+        y_true_t = torch.cat(all_y_true, dim=0)
+
+        pseudo, conf = compute_confidence(
+            mode=self.hparams.get("ultimateirm_confidence_mode", "A"),
+            probs=probs_t,
+            uid_list=all_uids,
+            memory_bank=self.memory_bank,
+            gamma=self.hparams.get("ultimateirm_temporal_gamma", 5.0),
+            beta=self.hparams.get("ultimateirm_resdisp_beta", 5.0),
+            dispersion_thresh=self.hparams.get("ultimateirm_resdisp_thresh", 0.05),
+            w_max=self.hparams.get("ultimateirm_conf_w_max", 1.0),
+            w_tmp=self.hparams.get("ultimateirm_conf_w_tmp", 1.0),
+            w_res=self.hparams.get("ultimateirm_conf_w_res", 1.0),
+        )
+
+        cluster_ids, cluster_meta = run_clustering(
+            mode=self.hparams.get("ultimateirm_cluster_mode", "A"),
+            features=feats_np,
+            k=self.hparams.get("ultimateirm_k", 3),
+            seed=0,
+        )
+
+        self.env_assignments = {uid: int(cid) for uid, cid in zip(all_uids, cluster_ids)}
+        self.memory_bank.update(
+            uid_list=all_uids,
+            probs=probs_t,
+            pseudo_labels=pseudo,
+            confidences=conf,
+            cluster_ids=cluster_ids,
+        )
+
+        cluster_sizes = dict(Counter(int(c) for c in cluster_ids))
+        self._latest_refresh_stats = {
+            "step": int(step),
+            "stage": "causal_optimization",
+            "num_samples": int(len(all_uids)),
+            "conf_mean": float(conf.mean().item()),
+            "conf_std": float(conf.std().item()),
+            "cluster_sizes": cluster_sizes,
+            "num_ood_gt": int((y_true_t < 0).sum().item()),
+        }
+
+        self.last_env_refresh_step = step
+        self.stage = "causal_optimization"
+        self.train()
 
     def update(self, minibatches, unlabeled=None, step=None):
         self.update_count += 1
-        all_x = torch.cat([b["x"] for b in minibatches]); all_y = torch.cat([b["y"] for b in minibatches])
-        logits = self.predict(all_x)
-        sup_loss = F.cross_entropy(logits, all_y)
+
+        all_x = torch.cat([b["x"] for b in minibatches], dim=0)
+        all_y = torch.cat([b["y"] for b in minibatches], dim=0)
+
+        logits_all = self.predict(all_x)
+        sup_loss = F.cross_entropy(logits_all, all_y)
+
+        labeled_weights, _ = compute_env_weights(
+            num_labeled_envs=len(minibatches),
+            unlabeled_cluster_sizes={},
+            lambda_labeled=self.hparams.get("ultimateirm_lambda_labeled", 1.0),
+            lambda_unlabeled=0.0,
+            size_norm=self.hparams.get("ultimateirm_size_norm", True),
+        )
+
         pen_a = torch.tensor(0.0, device=all_x.device)
-        for b in minibatches:
-            l = self.predict(b["x"]); w = torch.ones_like(b["y"], dtype=torch.float32, device=all_x.device)
-            pen_a = pen_a + self._irm_penalty_single_env(l, b["y"], w)
-        loss = sup_loss + self.hparams.get("ultimateirm_lambda_labeled", 1.0) * pen_a
+        for env_idx, b in enumerate(minibatches):
+            logits_env = self.predict(b["x"])
+            w_env = torch.ones_like(b["y"], dtype=torch.float32, device=all_x.device)
+            pen_a = pen_a + labeled_weights[env_idx] * self._irm_penalty_single_env(
+                logits_env, b["y"], w_env
+            )
+
         loss_u_strong = torch.tensor(0.0, device=all_x.device)
         loss_u_mask = torch.tensor(0.0, device=all_x.device)
         pen_b = torch.tensor(0.0, device=all_x.device)
-        if unlabeled:
-            xw = torch.cat([u["x_weak"] for u in unlabeled]); xs = torch.cat([u["x_strong"] for u in unlabeled]); xm = torch.cat([u["x_mask"] for u in unlabeled])
-            uid = sum([list(u["uid"]) for u in unlabeled], [])
-            with torch.no_grad():
-                pw = F.softmax(self.predict(xw), dim=1)
-                pseudo, conf = compute_confidence(self.hparams.get("ultimateirm_confidence_mode", "A"), pw, uid_list=uid, memory_bank=self.memory_bank, gamma=self.hparams.get("ultimateirm_temporal_gamma", 5.0), beta=self.hparams.get("ultimateirm_resdisp_beta", 5.0), dispersion_thresh=self.hparams.get("ultimateirm_resdisp_thresh", 0.05), w_max=self.hparams.get("ultimateirm_conf_w_max", 1.0), w_tmp=self.hparams.get("ultimateirm_conf_w_tmp", 1.0), w_res=self.hparams.get("ultimateirm_conf_w_res", 1.0))
-            mask_u = (conf >= self.hparams.get("ultimateirm_pseudo_conf_thresh", 0.8)).float().to(all_x.device)
-            ls = F.cross_entropy(self.predict(xs), pseudo.to(all_x.device), reduction="none")
-            loss_u_strong = (ls * mask_u).sum() / (mask_u.sum() + 1e-8)
-            tmp_gate = (conf >= self.hparams.get("ultimateirm_tmp_conf_thresh", 0.9)).to(all_x.device)
-            xm_masked = self.tmp_masker.apply(xm, tmp_gate)
-            lm = F.cross_entropy(self.predict(xm_masked), pseudo.to(all_x.device), reduction="none")
-            loss_u_mask = (lm * mask_u).sum() / (mask_u.sum() + 1e-8)
-            if self.stage == "causal_optimization" and len(self.env_assignments) > 0:
-                envs = torch.tensor([self.env_assignments.get(u, -1) for u in uid], device=all_x.device)
-                logits_s = self.predict(xs)
-                env_weights = compute_env_weights(self.cluster_sizes, lambda_unlabeled=self.hparams.get("ultimateirm_lambda_unlabeled", 1.0), size_norm=self.hparams.get("ultimateirm_size_norm", True))
-                for k in range(self.hparams.get("ultimateirm_k", 3)):
-                    mk = envs == k
-                    if mk.sum() < self.hparams.get("ultimateirm_min_cluster_size", 4): continue
-                    pen_b = pen_b + env_weights.get(k, 0.0) * self._irm_penalty_single_env(logits_s[mk], pseudo.to(all_x.device)[mk], conf.to(all_x.device)[mk])
-            self.memory_bank.update(uid, pw, pseudo, conf)
-            loss = loss + self.hparams.get("ultimateirm_lambda_u_strong", 1.0) * loss_u_strong + self.hparams.get("ultimateirm_lambda_u_mask", 1.0) * loss_u_mask + self.hparams.get("ultimateirm_lambda_unlabeled", 1.0) * pen_b
-        self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
-        return {"loss_total": float(loss.item()), "loss_sup": float(sup_loss.item()), "loss_u_strong": float(loss_u_strong.item()), "loss_u_mask": float(loss_u_mask.item()), "penalty_a": float(pen_a.item()), "penalty_b": float(pen_b.item()), "stage_id": 0 if self.stage == "warmup" else 2}
 
+        latest_rows = []
+
+        if unlabeled is not None and len(unlabeled) > 0:
+            xw = torch.cat([u["x_weak"] for u in unlabeled], dim=0)
+            xs = torch.cat([u["x_strong"] for u in unlabeled], dim=0)
+            xm = torch.cat([u["x_mask"] for u in unlabeled], dim=0)
+            y_true = torch.cat([u["y_true"] for u in unlabeled], dim=0)
+            uid = sum([list(u["uid"]) for u in unlabeled], [])
+
+            with torch.no_grad():
+                probs_w = F.softmax(self.predict(xw), dim=1)
+                pseudo, conf = compute_confidence(
+                    mode=self.hparams.get("ultimateirm_confidence_mode", "A"),
+                    probs=probs_w,
+                    uid_list=uid,
+                    memory_bank=self.memory_bank,
+                    gamma=self.hparams.get("ultimateirm_temporal_gamma", 5.0),
+                    beta=self.hparams.get("ultimateirm_resdisp_beta", 5.0),
+                    dispersion_thresh=self.hparams.get("ultimateirm_resdisp_thresh", 0.05),
+                    w_max=self.hparams.get("ultimateirm_conf_w_max", 1.0),
+                    w_tmp=self.hparams.get("ultimateirm_conf_w_tmp", 1.0),
+                    w_res=self.hparams.get("ultimateirm_conf_w_res", 1.0),
+                )
+
+            conf_dev = conf.to(all_x.device)
+            pseudo_dev = pseudo.to(all_x.device)
+
+            accept_mask = (conf_dev >= self.hparams.get("ultimateirm_pseudo_conf_thresh", 0.8)).float()
+
+            logits_s = self.predict(xs)
+            loss_s = F.cross_entropy(logits_s, pseudo_dev, reduction="none")
+            loss_u_strong = (loss_s * accept_mask).sum() / (accept_mask.sum() + 1e-8)
+
+            tmp_masked = self.guided_tmp.apply(xm, conf_dev)
+            logits_m = self.predict(tmp_masked)
+            loss_m = F.cross_entropy(logits_m, pseudo_dev, reduction="none")
+            loss_u_mask = (loss_m * accept_mask).sum() / (accept_mask.sum() + 1e-8)
+
+            cluster_sizes = {}
+            if self.stage == "causal_optimization" and len(self.env_assignments) > 0:
+                env_ids = torch.tensor(
+                    [self.env_assignments.get(u, -1) for u in uid],
+                    device=all_x.device,
+                    dtype=torch.long,
+                )
+
+                min_cluster_size = self.hparams.get("ultimateirm_min_cluster_size", 4)
+                for k in range(self.hparams.get("ultimateirm_k", 3)):
+                    count_k = int((env_ids == k).sum().item())
+                    if count_k >= min_cluster_size:
+                        cluster_sizes[k] = count_k
+
+                _, unlabeled_weights = compute_env_weights(
+                    num_labeled_envs=len(minibatches),
+                    unlabeled_cluster_sizes=cluster_sizes,
+                    lambda_labeled=0.0,
+                    lambda_unlabeled=self.hparams.get("ultimateirm_lambda_unlabeled", 1.0),
+                    size_norm=self.hparams.get("ultimateirm_size_norm", True),
+                )
+
+                for k, w_k in unlabeled_weights.items():
+                    mk = (env_ids == k)
+                    pen_b = pen_b + float(w_k) * self._irm_penalty_single_env(
+                        logits_s[mk], pseudo_dev[mk], conf_dev[mk]
+                    )
+
+            self.memory_bank.update(
+                uid_list=uid,
+                probs=probs_w,
+                pseudo_labels=pseudo,
+                confidences=conf,
+                cluster_ids=[self.env_assignments.get(u, -1) for u in uid],
+            )
+
+            tmp_applied_mask = (
+                conf_dev >= self.hparams.get("ultimateirm_tmp_conf_thresh", 0.9)
+            )
+
+            for i, u in enumerate(uid):
+                latest_rows.append({
+                    "uid": u,
+                    "y_true": int(y_true[i].item()),
+                    "pseudo": int(pseudo_dev[i].item()),
+                    "confidence": float(conf_dev[i].item()),
+                    "accepted": int(accept_mask[i].item() > 0),
+                    "tmp_applied": int(tmp_applied_mask[i].item()),
+                    "cluster_id": int(self.env_assignments.get(u, -1)),
+                    "is_ood_gt": int(y_true[i].item() < 0),
+                })
+
+        self._latest_sample_rows = latest_rows
+
+        total_loss = (
+            sup_loss
+            + pen_a
+            + self.hparams.get("ultimateirm_lambda_u_strong", 1.0) * loss_u_strong
+            + self.hparams.get("ultimateirm_lambda_u_mask", 1.0) * loss_u_mask
+            + pen_b
+        )
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        out = {
+            "loss_total": float(total_loss.item()),
+            "loss_sup": float(sup_loss.item()),
+            "loss_u_strong": float(loss_u_strong.item()),
+            "loss_u_mask": float(loss_u_mask.item()),
+            "penalty_a": float(pen_a.item()),
+            "penalty_b": float(pen_b.item()),
+            "stage_id": 0 if self.stage == "warmup" else 2,
+        }
+
+        if len(latest_rows) > 0:
+            conf_tensor = torch.tensor([r["confidence"] for r in latest_rows], device=all_x.device)
+            out["conf_mean"] = float(conf_tensor.mean().item())
+            out["conf_std"] = float(conf_tensor.std().item())
+            out["pseudo_accept_rate"] = float(
+                np.mean([r["accepted"] for r in latest_rows])
+            )
+            out["tmp_applied_rate"] = float(
+                np.mean([r["tmp_applied"] for r in latest_rows])
+            )
+
+        return out
+
+    @torch.no_grad()
     def export_diagnostics(self, output_dir, step):
-        import os, json
-        d = os.path.join(output_dir, "diagnostics", f"step_{step:06d}")
-        os.makedirs(d, exist_ok=True)
-        self.memory_bank.export_csv(os.path.join(d, "memory_bank_snapshot.csv"))
-        with open(os.path.join(d, "env_assignments.json"), "w") as f:
-            json.dump(self.env_assignments, f)
-        with open(os.path.join(d, "cluster_stats.json"), "w") as f:
-            json.dump({"cluster_sizes": self.cluster_sizes, "stage": self.stage}, f)
+        diag_dir = os.path.join(output_dir, "diagnostics", f"step_{step:07d}")
+        os.makedirs(diag_dir, exist_ok=True)
+
+        self.memory_bank.export_csv(os.path.join(diag_dir, "memory_bank.csv"))
+
+        with open(os.path.join(diag_dir, "env_assignments.json"), "w", encoding="utf-8") as f:
+            json.dump(self.env_assignments, f, indent=2)
+
+        with open(os.path.join(diag_dir, "refresh_stats.json"), "w", encoding="utf-8") as f:
+            json.dump(self._latest_refresh_stats, f, indent=2)
+
+        if len(self._latest_sample_rows) > 0:
+            csv_path = os.path.join(diag_dir, "unlabeled_samples.csv")
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "uid",
+                        "y_true",
+                        "pseudo",
+                        "confidence",
+                        "accepted",
+                        "tmp_applied",
+                        "cluster_id",
+                        "is_ood_gt",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(self._latest_sample_rows)
 
     def predict(self, x):
         return self.network(x)

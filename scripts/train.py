@@ -109,24 +109,27 @@ if __name__ == "__main__":
     uda_splits = []
 
     if args.dataset == "OpenSetDomainNetObjects":
+        env_names = list(getattr(dataset, "ENVIRONMENTS", []))
         for env_i, env in enumerate(dataset):
+            env_name = env_names[env_i]
             if env_i in unlabeled_envs:
                 uda_splits.append((env, None))
                 continue
-
             if env_i in eval_only_envs:
-                eval_splits.append((f'env{env_i}_full', env, None))
+                eval_splits.append((env_name, env, None))
                 continue
-
-            out, in_ = misc.split_dataset(env, int(len(env)*args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
-            if hparams['class_balanced']:
+            out, in_ = misc.split_dataset(
+                env,
+                int(len(env) * args.holdout_fraction),
+                misc.seed_hash(args.trial_seed, env_i),
+            )
+            if hparams["class_balanced"]:
                 in_weights = misc.make_weights_for_balanced_classes(in_)
                 out_weights = misc.make_weights_for_balanced_classes(out)
             else:
                 in_weights, out_weights = None, None
-
-            train_splits.append((env_i, in_, in_weights))
-            eval_splits.append((f'env{env_i}_out', out, out_weights))
+            train_splits.append((env_name, in_, in_weights))
+            eval_splits.append((f"{env_name}_out", out, out_weights))
     else:
         for env_i, env in enumerate(dataset):
             out, in_ = misc.split_dataset(env, int(len(env)*args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
@@ -215,15 +218,18 @@ if __name__ == "__main__":
             id_loader_for_ood = None
             ood_loader = None
             for name, loader, weights in evals:
-                if "env3" in name:
+                if name == "B_id_eval":
                     id_loader_for_ood = loader
-                if "env4" in name:
-                    ood_loader = loader
-                if "ood" in name.lower() or "env4" in name:
+                    results[f"{name}_acc"] = misc.accuracy(algorithm, loader, weights, device)
                     continue
-                results[name+'_acc'] = misc.accuracy(algorithm, loader, weights, device)
+                if name == "B_ood_eval":
+                    ood_loader = loader
+                    continue
+                results[f"{name}_acc"] = misc.accuracy(algorithm, loader, weights, device)
             if id_loader_for_ood is not None and ood_loader is not None:
-                results.update(openset_eval.evaluate_ood(algorithm, id_loader_for_ood, ood_loader, device))
+                results.update(openset_eval.evaluate_ood(algorithm=algorithm, id_loader=id_loader_for_ood, ood_loader=ood_loader, device=device))
+            else:
+                results["ood_eval_missing"] = 1.0
             results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
             results_keys = sorted(results.keys())
             if results_keys != last_results_keys:
