@@ -506,11 +506,15 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
         b_id_split = int(0.8 * len(b_id_all))
         b_id_train = b_id_all[:b_id_split]
         b_id_eval = b_id_all[b_id_split:]
+        assert len(b_id_train) > 0, "B_id_train is empty"
+        assert len(b_id_eval) > 0, "B_id_eval is empty"
 
         rng.shuffle(ood_all)
         ood_split = int(0.8 * len(ood_all))
         ood_train_pool = ood_all[:ood_split]
         ood_eval = ood_all[ood_split:]
+        assert len(ood_train_pool) > 0, "OOD train pool is empty"
+        assert len(ood_eval) > 0, "OOD eval is empty"
 
         rho = hparams.get("open_set_ood_ratio", 0.5)
         assert 0.0 <= rho < 1.0, f"Invalid open_set_ood_ratio: {rho}"
@@ -518,8 +522,10 @@ class OpenSetDomainNetObjects(MultipleDomainDataset):
         num_id = len(b_id_train)
         num_ood = int(num_id * rho / max(1e-8, (1 - rho)))
         ood_selected = sample_n(ood_train_pool, min(num_ood, len(ood_train_pool)), seed=4)
+        assert len(ood_selected) > 0, "No OOD selected into B_mix"
 
         b_mix_samples = b_id_train + ood_selected
+        assert len(b_mix_samples) > 0, "B_mix is empty"
         rng.shuffle(b_mix_samples)
 
         for s in b_id_eval:

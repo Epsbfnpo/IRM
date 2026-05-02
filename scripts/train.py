@@ -81,25 +81,53 @@ if __name__ == "__main__":
     train_splits = []
     eval_splits = []
     uda_splits = []
-    for env_i, env in enumerate(dataset):
-        if env_i in unlabeled_envs:
-            uda_splits.append((env, None))
-            continue
 
-        if env_i in eval_only_envs:
-            if env_i not in ood_eval_envs:
-                eval_splits.append((f'env{env_i}_full', env, None))
-            continue
+    if args.dataset == "OpenSetDomainNetObjects":
+        for env_i, env in enumerate(dataset):
+            if env_i in unlabeled_envs:
+                uda_splits.append((env, None))
+                continue
 
-        out, in_ = misc.split_dataset(env, int(len(env)*args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
-        if hparams['class_balanced']:
-            in_weights = misc.make_weights_for_balanced_classes(in_)
-            out_weights = misc.make_weights_for_balanced_classes(out)
-        else:
-            in_weights, out_weights = None, None
+            if env_i in eval_only_envs:
+                if env_i not in ood_eval_envs:
+                    eval_splits.append((f'env{env_i}_full', env, None))
+                continue
 
-        train_splits.append((env_i, in_, in_weights))
-        eval_splits.append((f'env{env_i}_out', out, out_weights))
+            out, in_ = misc.split_dataset(env, int(len(env)*args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
+            if hparams['class_balanced']:
+                in_weights = misc.make_weights_for_balanced_classes(in_)
+                out_weights = misc.make_weights_for_balanced_classes(out)
+            else:
+                in_weights, out_weights = None, None
+
+            train_splits.append((env_i, in_, in_weights))
+            eval_splits.append((f'env{env_i}_out', out, out_weights))
+    else:
+        for env_i, env in enumerate(dataset):
+            out, in_ = misc.split_dataset(env, int(len(env)*args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
+            if hparams['class_balanced']:
+                in_weights = misc.make_weights_for_balanced_classes(in_)
+                out_weights = misc.make_weights_for_balanced_classes(out)
+            else:
+                in_weights, out_weights = None, None
+
+            if env_i in test_envs:
+                uda_subset = []
+                uda_subset_weights = None
+                if args.task == "domain_adaptation":
+                    uda_subset, in_ = misc.split_dataset(in_, int(len(in_)*args.uda_holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
+                    if hparams['class_balanced']:
+                        uda_subset_weights = misc.make_weights_for_balanced_classes(uda_subset)
+                        in_weights = misc.make_weights_for_balanced_classes(in_)
+                if len(uda_subset):
+                    uda_splits.append((uda_subset, uda_subset_weights))
+
+            else:
+                train_splits.append((env_i, in_, in_weights))
+
+            if env_i in test_envs:
+                eval_splits.append((f'env{env_i}_in', in_, in_weights))
+            eval_splits.append((f'env{env_i}_out', out, out_weights))
 
     if args.task == "domain_adaptation" and len(uda_splits) == 0:
         raise ValueError("Not enough unlabeled samples for domain adaptation.")
