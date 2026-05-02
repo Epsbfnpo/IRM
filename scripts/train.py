@@ -15,6 +15,7 @@ from domainbed import datasets
 from domainbed import hparams_registry
 from domainbed import algorithms
 from domainbed.lib import misc
+from domainbed.lib import openset_eval
 from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
 
 def unpack_batch(batch):
@@ -209,10 +210,19 @@ if __name__ == "__main__":
             results = {'step': step, 'epoch': step / steps_per_epoch,}
             for key, val in checkpoint_vals.items():
                 results[key] = np.mean(val)
-            evals = zip(eval_loader_names, eval_loaders, eval_weights)
+            evals = list(zip(eval_loader_names, eval_loaders, eval_weights))
+            id_loader_for_ood = None
+            ood_loader = None
             for name, loader, weights in evals:
-                acc = misc.accuracy(algorithm, loader, weights, device)
-                results[name+'_acc'] = acc
+                if "env3" in name:
+                    id_loader_for_ood = loader
+                if "env4" in name:
+                    ood_loader = loader
+                if "ood" in name.lower() or "env4" in name:
+                    continue
+                results[name+'_acc'] = misc.accuracy(algorithm, loader, weights, device)
+            if id_loader_for_ood is not None and ood_loader is not None:
+                results.update(openset_eval.evaluate_ood(algorithm, id_loader_for_ood, ood_loader, device))
             results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
             results_keys = sorted(results.keys())
             if results_keys != last_results_keys:
